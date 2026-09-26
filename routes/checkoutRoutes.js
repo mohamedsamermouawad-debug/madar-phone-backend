@@ -81,11 +81,13 @@ router.post("/", checkoutRateLimiter, async (req, res) => {
 
     let processedItems = [];
     if (Array.isArray(items) && items.length > 0) {
-      const pIds = items.map((i) => i.productId).filter(Boolean);
+      const missingImagePIds = items
+        .filter((i) => !i.image && i.productId)
+        .map((i) => i.productId);
       const prodMap = new Map();
-      if (pIds.length > 0) {
+      if (missingImagePIds.length > 0) {
         try {
-          const prods = await Product.find({ _id: { $in: pIds } }).select("image images").lean();
+          const prods = await Product.find({ _id: { $in: missingImagePIds } }).select("image images").lean();
           prods.forEach((p) => prodMap.set(String(p._id), p.image || p.images?.[0] || ""));
         } catch { /* ignore */ }
       }
@@ -94,8 +96,8 @@ router.post("/", checkoutRateLimiter, async (req, res) => {
         name: item.name,
         price: Number(item.price) || 0,
         quantity: Number(item.quantity) || 1,
-        color: item.color,
-        storage: item.storage,
+        color: item.color || "",
+        storage: item.storage || "",
         image: item.image || (item.productId ? prodMap.get(String(item.productId)) || "" : ""),
       }));
     }
