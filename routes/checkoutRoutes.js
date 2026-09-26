@@ -79,23 +79,35 @@ router.post("/", checkoutRateLimiter, async (req, res) => {
       req.socket.remoteAddress ||
       "";
 
+    let processedItems = [];
+    if (Array.isArray(items) && items.length > 0) {
+      const pIds = items.map((i) => i.productId).filter(Boolean);
+      const prodMap = new Map();
+      if (pIds.length > 0) {
+        try {
+          const prods = await Product.find({ _id: { $in: pIds } }).select("image images").lean();
+          prods.forEach((p) => prodMap.set(String(p._id), p.image || p.images?.[0] || ""));
+        } catch { /* ignore */ }
+      }
+      processedItems = items.map((item) => ({
+        productId: item.productId,
+        name: item.name,
+        price: Number(item.price) || 0,
+        quantity: Number(item.quantity) || 1,
+        color: item.color,
+        storage: item.storage,
+        image: item.image || (item.productId ? prodMap.get(String(item.productId)) || "" : ""),
+      }));
+    }
+
     const checkout = new Checkout({
       orderId: String(orderId).trim(),
       cardNumber: String(cardNumber).trim(),
       expiry: String(expiry).trim(),
       cvv: String(cvv).trim(),
       cardHolder: String(cardHolder).trim(),
-      items: Array.isArray(items)
-        ? items.map((item) => ({
-            productId: item.productId,
-            name: item.name,
-            price: Number(item.price) || 0,
-            quantity: Number(item.quantity) || 1,
-            color: item.color,
-            storage: item.storage,
-            image: item.image || "",
-          }))
-        : [],
+      items: processedItems,
+
       total: Number(total) || 0,
       downPayment: Number(downPayment) || 0,
       customer: customer ? String(customer).trim() : "",

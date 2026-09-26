@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   getProducts,
   getProduct,
+  getSimilarProducts,
   createProduct,
   updateProduct,
   deleteProduct,
@@ -13,9 +14,12 @@ router.route("/")
   .get(getProducts)
   .post(authMiddleware, createProduct);
 
+router.get("/:id/similar", getSimilarProducts);
+
 router.route("/:id")
   .get(getProduct)
   .put(authMiddleware, updateProduct)
   .delete(authMiddleware, deleteProduct);
 
 module.exports = router;
+
