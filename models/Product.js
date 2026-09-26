@@ -124,8 +124,12 @@ productSchema.virtual("price").get(function () {
 
 productSchema.index({ name: 1 });
 productSchema.index({ category: 1, brand: 1 });
-productSchema.index({ subCategory: 1 });
+productSchema.index({ category: 1, createdAt: -1 });
+productSchema.index({ subCategory: 1, createdAt: -1 });
+productSchema.index({ inStock: 1, category: 1 });
 productSchema.index({ createdAt: -1 });
+productSchema.index({ name: "text", brand: "text", category: "text" });
 
 module.exports = mongoose.model("Product", productSchema);
+
 

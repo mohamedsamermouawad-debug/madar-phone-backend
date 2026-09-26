@@ -235,11 +235,23 @@ router.put("/company", authMiddleware, async (req, res) => {
   try {
     let company = await Company.findOne();
     if (!company) company = await Company.create({});
-    Object.assign(company, req.body);
+    const body = { ...req.body };
+    if (body.linkType1 !== undefined && body.link1Type === undefined) {
+      body.link1Type = body.linkType1;
+    } else if (body.link1Type !== undefined && body.linkType1 === undefined) {
+      body.linkType1 = body.link1Type;
+    }
+    if (body.linkType2 !== undefined && body.link2Type === undefined) {
+      body.link2Type = body.linkType2;
+    } else if (body.link2Type !== undefined && body.linkType2 === undefined) {
+      body.linkType2 = body.link2Type;
+    }
+    Object.assign(company, body);
     await company.save();
     cache.del("company_data");
     res.json(company);
-  } catch {
+  } catch (err) {
+    console.error("PUT /company error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1327,13 +1339,33 @@ router.post("/company/footer-image/:key", authMiddleware, upload.single("image")
     const result = await uploadToCloudinary(req.file.buffer, "company");
     company[key] = result.secure_url;
     await company.save();
+    cache.del("company_data");
     res.json({ url: company[key] });
-  } catch {
+  } catch (err) {
+    console.error("company/footer-image error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
 
-// POST /api/admin/company/footer-file/:key  (files: file1, file2)
+// DELETE /api/admin/company/footer-image/:key
+router.delete("/company/footer-image/:key", authMiddleware, async (req, res) => {
+  try {
+    const { key } = req.params;
+    if (!["qrImage", "img1", "img2"].includes(key)) return res.status(400).json({ error: "حقل غير مسموح" });
+    let company = await Company.findOne();
+    if (!company) return res.json({ success: true });
+    await deleteFromCloudinary(company[key]);
+    company[key] = "";
+    await company.save();
+    cache.del("company_data");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE company/footer-image error:", err);
+    res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+// POST /api/admin/company/footer-file/:key  (files: file1, file2, qrFile)
 router.post("/company/footer-file/:key", authMiddleware, uploadDoc.single("file"), async (req, res) => {
   try {
     const { key } = req.params;
@@ -1345,8 +1377,28 @@ router.post("/company/footer-file/:key", authMiddleware, uploadDoc.single("file"
     const result = await uploadToCloudinary(req.file.buffer, "docs", { resource_type: "raw" });
     company[key] = result.secure_url;
     await company.save();
+    cache.del("company_data");
     res.json({ url: company[key] });
-  } catch {
+  } catch (err) {
+    console.error("company/footer-file error:", err);
+    res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+// DELETE /api/admin/company/footer-file/:key
+router.delete("/company/footer-file/:key", authMiddleware, async (req, res) => {
+  try {
+    const { key } = req.params;
+    if (!["file1", "file2", "qrFile"].includes(key)) return res.status(400).json({ error: "حقل غير مسموح" });
+    let company = await Company.findOne();
+    if (!company) return res.json({ success: true });
+    await deleteFromCloudinary(company[key], "raw");
+    company[key] = "";
+    await company.save();
+    cache.del("company_data");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE company/footer-file error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1356,18 +1408,44 @@ router.post("/company/footer-items/image/:index", authMiddleware, upload.single(
   try {
     const index = parseInt(req.params.index);
     if (!req.file) return res.status(400).json({ error: "لم يتم رفع صورة" });
+    if (isNaN(index) || index < 0 || index > 20) return res.status(400).json({ error: "رقم غير صحيح" });
     let company = await Company.findOne();
     if (!company) company = await Company.create({});
-    if (isNaN(index) || index < 0 || index >= company.footerItems.length)
-      return res.status(400).json({ error: "رقم غير صحيح" });
+    if (!Array.isArray(company.footerItems)) company.footerItems = [];
+    while (company.footerItems.length <= index) {
+      company.footerItems.push({ image: "", linkType: "link", link: "", file: "" });
+    }
     const old = company.footerItems[index]?.image;
     await deleteFromCloudinary(old);
     const result = await uploadToCloudinary(req.file.buffer, "company");
     company.footerItems[index].image = result.secure_url;
     company.markModified("footerItems");
     await company.save();
+    cache.del("company_data");
     res.json({ url: company.footerItems[index].image });
-  } catch {
+  } catch (err) {
+    console.error("footer-items/image error:", err);
+    res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+// DELETE /api/admin/company/footer-items/:index/image
+router.delete("/company/footer-items/:index/image", authMiddleware, async (req, res) => {
+  try {
+    const index = parseInt(req.params.index);
+    let company = await Company.findOne();
+    if (!company || !Array.isArray(company.footerItems) || isNaN(index) || index < 0 || index >= company.footerItems.length) {
+      return res.json({ success: true });
+    }
+    const old = company.footerItems[index]?.image;
+    await deleteFromCloudinary(old);
+    company.footerItems[index].image = "";
+    company.markModified("footerItems");
+    await company.save();
+    cache.del("company_data");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE footer-items/:index/image error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1377,18 +1455,44 @@ router.post("/company/footer-items/file/:index", authMiddleware, uploadDoc.singl
   try {
     const index = parseInt(req.params.index);
     if (!req.file) return res.status(400).json({ error: "لم يتم رفع ملف" });
+    if (isNaN(index) || index < 0 || index > 20) return res.status(400).json({ error: "رقم غير صحيح" });
     let company = await Company.findOne();
     if (!company) company = await Company.create({});
-    if (isNaN(index) || index < 0 || index >= company.footerItems.length)
-      return res.status(400).json({ error: "رقم غير صحيح" });
+    if (!Array.isArray(company.footerItems)) company.footerItems = [];
+    while (company.footerItems.length <= index) {
+      company.footerItems.push({ image: "", linkType: "link", link: "", file: "" });
+    }
     const old = company.footerItems[index]?.file;
     await deleteFromCloudinary(old, "raw");
     const result = await uploadToCloudinary(req.file.buffer, "docs", { resource_type: "raw" });
     company.footerItems[index].file = result.secure_url;
     company.markModified("footerItems");
     await company.save();
+    cache.del("company_data");
     res.json({ url: company.footerItems[index].file });
-  } catch {
+  } catch (err) {
+    console.error("footer-items/file error:", err);
+    res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+// DELETE /api/admin/company/footer-items/:index/file
+router.delete("/company/footer-items/:index/file", authMiddleware, async (req, res) => {
+  try {
+    const index = parseInt(req.params.index);
+    let company = await Company.findOne();
+    if (!company || !Array.isArray(company.footerItems) || isNaN(index) || index < 0 || index >= company.footerItems.length) {
+      return res.json({ success: true });
+    }
+    const old = company.footerItems[index]?.file;
+    await deleteFromCloudinary(old, "raw");
+    company.footerItems[index].file = "";
+    company.markModified("footerItems");
+    await company.save();
+    cache.del("company_data");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE footer-items/:index/file error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1398,10 +1502,14 @@ router.post("/company/footer-items/add", authMiddleware, async (req, res) => {
   try {
     let company = await Company.findOne();
     if (!company) company = await Company.create({});
+    if (!Array.isArray(company.footerItems)) company.footerItems = [];
+    if (company.footerItems.length >= 10) return res.status(400).json({ error: "الحد الأقصى 10 عناصر" });
     company.footerItems.push({ image: "", linkType: "link", link: "", file: "" });
     await company.save();
-    res.json({ index: company.footerItems.length - 1 });
-  } catch {
+    cache.del("company_data");
+    res.json({ index: company.footerItems.length - 1, item: company.footerItems[company.footerItems.length - 1] });
+  } catch (err) {
+    console.error("footer-items/add error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1411,17 +1519,21 @@ router.delete("/company/footer-items/:index", authMiddleware, async (req, res) =
   try {
     const index = parseInt(req.params.index);
     let company = await Company.findOne();
-    if (!company) return res.json({ success: true });
+    if (!company || !Array.isArray(company.footerItems)) return res.json({ success: true });
     if (isNaN(index) || index < 0 || index >= company.footerItems.length)
       return res.status(400).json({ error: "رقم غير صحيح" });
     const item = company.footerItems[index];
-    await deleteFromCloudinary(item.image);
-    await deleteFromCloudinary(item.file);
+    if (item) {
+      if (item.image) await deleteFromCloudinary(item.image);
+      if (item.file) await deleteFromCloudinary(item.file, "raw");
+    }
     company.footerItems.splice(index, 1);
     company.markModified("footerItems");
     await company.save();
+    cache.del("company_data");
     res.json({ success: true });
-  } catch {
+  } catch (err) {
+    console.error("DELETE footer-items/:index error:", err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });

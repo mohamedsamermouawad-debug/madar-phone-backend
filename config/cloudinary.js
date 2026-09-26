@@ -33,9 +33,15 @@ function makeImageUpload() { return imageUpload; }
 function makeFileUpload() { return fileUpload; }
 
 function uploadToCloudinary(buffer, folder, options = {}) {
+  const defaultOptions = {
+    folder,
+    quality: "auto",
+    fetch_format: "auto",
+    ...options,
+  };
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
-      { folder, ...options },
+      defaultOptions,
       (err, result) => (err ? reject(err) : resolve(result))
     );
     Readable.from(buffer).pipe(stream);
@@ -43,17 +49,30 @@ function uploadToCloudinary(buffer, folder, options = {}) {
 }
 
 async function deleteFromCloudinary(url, resource_type = "image") {
-  if (!url || !url.includes("cloudinary.com")) return;
+  if (!url || typeof url !== "string" || !url.includes("cloudinary.com")) return;
   try {
+    const isRaw = resource_type === "raw" || url.includes("/raw/upload/");
+    const resType = isRaw ? "raw" : "image";
     const parts = url.split("/");
     const uploadIndex = parts.indexOf("upload");
+    if (uploadIndex === -1) return;
     let pathParts = parts.slice(uploadIndex + 1);
     if (/^v\d+$/.test(pathParts[0])) pathParts = pathParts.slice(1);
-    const publicId = pathParts.join("/").replace(/\.[^/.]+$/, "");
-    await cloudinary.uploader.destroy(publicId, { resource_type });
+    let publicId = pathParts.join("/");
+    if (resType !== "raw") {
+      publicId = publicId.replace(/\.[^/.]+$/, "");
+    }
+    await cloudinary.uploader.destroy(publicId, { resource_type: resType });
   } catch (e) {
     console.error("Cloudinary delete error:", e.message);
   }
 }
 
-module.exports = { cloudinary, makeImageUpload, makeFileUpload, uploadToCloudinary, deleteFromCloudinary };
+async function deleteMultipleFromCloudinary(urls, resource_type = "image") {
+  if (!Array.isArray(urls) || !urls.length) return;
+  const validUrls = urls.filter((u) => u && typeof u === "string" && u.includes("cloudinary.com"));
+  await Promise.allSettled(validUrls.map((u) => deleteFromCloudinary(u, resource_type)));
+}
+
+module.exports = { cloudinary, makeImageUpload, makeFileUpload, uploadToCloudinary, deleteFromCloudinary, deleteMultipleFromCloudinary };
+
