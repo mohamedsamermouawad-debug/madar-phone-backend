@@ -15,6 +15,10 @@ connectDB();
 
 const app = express();
 
+// Trust reverse proxy (e.g. Nginx, Railway, Render) so that express-rate-limit
+// can read the real client IP from the X-Forwarded-For header correctly.
+app.set("trust proxy", 1);
+
 // Security Headers
 app.use(
   helmet({

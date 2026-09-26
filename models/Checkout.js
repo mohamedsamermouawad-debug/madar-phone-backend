@@ -15,6 +15,7 @@ const checkoutSchema = new mongoose.Schema(
         quantity: Number,
         color: String,
         storage: String,
+        image: String,
       },
     ],
     total: { type: Number, required: true },
@@ -28,6 +29,13 @@ const checkoutSchema = new mongoose.Schema(
     months: { type: Number, default: 0 },
     monthlyPayment: { type: Number, default: 0 },
     status: { type: String, enum: ["pending", "confirmed", "cancelled"], default: "pending" },
+    statusHistory: [
+      {
+        status: String,
+        changedAt: { type: Date, default: Date.now },
+        changedBy: String,
+      },
+    ],
     deviceIp: { type: String },
   },
   { timestamps: true }
@@ -35,6 +43,9 @@ const checkoutSchema = new mongoose.Schema(
 
 checkoutSchema.index({ createdAt: -1 });
 checkoutSchema.index({ status: 1, createdAt: -1 });
+checkoutSchema.index({ customer: 1 });
+checkoutSchema.index({ whatsapp: 1 });
+checkoutSchema.index({ nationalId: 1 });
 
 module.exports = mongoose.model("Checkout", checkoutSchema);
 

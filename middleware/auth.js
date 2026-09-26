@@ -10,8 +10,16 @@ function authMiddleware(req, res, next) {
     return res.status(401).json({ error: "غير مصرح" });
   }
 
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    console.error("CRITICAL: JWT_SECRET environment variable is missing!");
+    if (process.env.NODE_ENV === "production") {
+      return res.status(500).json({ error: "خطأ في تهيئة الخادم" });
+    }
+  }
+
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "default_jwt_secret");
+    const decoded = jwt.verify(token, secret || "default_jwt_secret_dev_only");
     req.admin = decoded;
     next();
   } catch (err) {

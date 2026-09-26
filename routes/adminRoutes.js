@@ -9,9 +9,7 @@ const SubCategorySettings = require("../models/SubCategorySettings");
 const SubCategory = require("../models/SubCategory");
 const Review = require("../models/Review");
 const Checkout = require("../models/Checkout");
-const Bank = require("../models/Bank");
 const CategoryBanner = require("../models/CategoryBanner");
-const CardFieldSettings = require("../models/CardFieldSettings");
 const { makeImageUpload, makeFileUpload, uploadToCloudinary, deleteFromCloudinary } = require("../config/cloudinary");
 const authMiddleware = require("../middleware/auth");
 
@@ -356,15 +354,28 @@ router.delete("/banners/:index", authMiddleware, async (req, res) => {
 });
 
 
+// Category cache helper
+function invalidateCategoryCache() {
+  cache.delPrefix("categories_");
+  cache.delPrefix("sub_categories_");
+  cache.delPrefix("category_items_");
+  cache.delPrefix("main_categories_");
+}
+
 // GET /api/admin/main-categories - distinct from products with count
 router.get("/main-categories", authMiddleware, async (req, res) => {
   try {
+    const cached = cache.get("main_categories_list");
+    if (cached) return res.json(cached);
+
     const result = await Product.aggregate([
       { $match: { subCategory: { $ne: null, $exists: true } } },
       { $group: { _id: "$subCategory", count: { $sum: 1 } } },
       { $sort: { _id: 1 } },
     ]);
-    res.json(result.map((r) => ({ name: r._id, count: r.count })));
+    const list = result.map((r) => ({ name: r._id, count: r.count }));
+    cache.set("main_categories_list", list, 300);
+    res.json(list);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -373,8 +384,13 @@ router.get("/main-categories", authMiddleware, async (req, res) => {
 // GET /api/admin/categories - distinct category values from products
 router.get("/categories", authMiddleware, async (req, res) => {
   try {
+    const cached = cache.get("categories_distinct");
+    if (cached) return res.json(cached);
+
     const cats = await Product.distinct("category");
-    res.json(cats.filter(Boolean).sort());
+    const result = cats.filter(Boolean).sort();
+    cache.set("categories_distinct", result, 300);
+    res.json(result);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -385,12 +401,13 @@ router.post("/main-categories", authMiddleware, async (req, res) => {
   try {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "اسم التصنيف مطلوب" });
-    const exists = await Product.findOne({ category: name.trim() });
+    const trimmed = name.trim();
+    const exists = await Product.findOne({ category: trimmed });
     if (exists) return res.status(400).json({ error: "التصنيف موجود بالفعل" });
-    // Store as a placeholder product-less category via MainCategory
-    const existsMC = await MainCategory.findOne({ name: name.trim() });
+    const existsMC = await MainCategory.findOne({ name: trimmed });
     if (existsMC) return res.status(400).json({ error: "التصنيف موجود بالفعل" });
-    const cat = await MainCategory.create({ name: name.trim() });
+    const cat = await MainCategory.create({ name: trimmed });
+    invalidateCategoryCache();
     res.status(201).json({ name: cat.name, count: 0 });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -400,16 +417,21 @@ router.post("/main-categories", authMiddleware, async (req, res) => {
 // GET /api/admin/main-categories/extra - all subCategories (from products + MainCategory)
 router.get("/main-categories/extra", authMiddleware, async (req, res) => {
   try {
+    const cached = cache.get("main_categories_extra");
+    if (cached) return res.json(cached);
+
     const [productAgg, manualCats] = await Promise.all([
       Product.aggregate([
         { $match: { subCategory: { $ne: null, $exists: true } } },
         { $group: { _id: "$subCategory", count: { $sum: 1 } } },
       ]),
-      MainCategory.find(),
+      MainCategory.find().lean(),
     ]);
     const productMap = new Map(productAgg.map((r) => [r._id, r.count]));
     const allNames = new Set([...productMap.keys(), ...manualCats.map((c) => c.name)]);
-    res.json([...allNames].sort().map((name) => ({ name, count: productMap.get(name) || 0 })));
+    const list = [...allNames].sort().map((name) => ({ name, count: productMap.get(name) || 0 }));
+    cache.set("main_categories_extra", list, 300);
+    res.json(list);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -424,6 +446,7 @@ router.put("/main-categories/rename", authMiddleware, async (req, res) => {
     if (exists && newName.trim() !== oldName.trim()) return res.status(400).json({ error: "التصنيف موجود بالفعل" });
     await Product.updateMany({ subCategory: oldName }, { $set: { subCategory: newName.trim() } });
     await MainCategory.updateOne({ name: oldName }, { $set: { name: newName.trim() } });
+    invalidateCategoryCache();
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -437,6 +460,7 @@ router.delete("/main-categories/remove", authMiddleware, async (req, res) => {
     if (!name) return res.status(400).json({ error: "اسم التصنيف مطلوب" });
     await Product.updateMany({ category: name }, { $unset: { category: "" } });
     await MainCategory.deleteOne({ name });
+    invalidateCategoryCache();
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -448,11 +472,13 @@ router.post("/sub-categories", authMiddleware, async (req, res) => {
   try {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "اسم التصنيف الفرعي مطلوب" });
-    const existsInProducts = await Product.findOne({ subCategory: name.trim() });
+    const trimmed = name.trim();
+    const existsInProducts = await Product.findOne({ subCategory: trimmed });
     if (existsInProducts) return res.status(400).json({ error: "التصنيف الفرعي موجود بالفعل" });
-    const existsSC = await SubCategory.findOne({ name: name.trim() });
+    const existsSC = await SubCategory.findOne({ name: trimmed });
     if (existsSC) return res.status(400).json({ error: "التصنيف الفرعي موجود بالفعل" });
-    const sc = await SubCategory.create({ name: name.trim() });
+    const sc = await SubCategory.create({ name: trimmed });
+    invalidateCategoryCache();
     res.status(201).json({ name: sc.name, count: 0 });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -462,7 +488,7 @@ router.post("/sub-categories", authMiddleware, async (req, res) => {
 // GET /api/admin/sub-categories/all - all from MainCategory collection
 router.get("/sub-categories/all", authMiddleware, async (req, res) => {
   try {
-    const cats = await MainCategory.find().sort({ name: 1 });
+    const cats = await MainCategory.find().sort({ name: 1 }).lean();
     res.json(cats.map((c) => ({ _id: c._id, name: c.name })));
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -472,10 +498,86 @@ router.get("/sub-categories/all", authMiddleware, async (req, res) => {
 // GET /api/admin/sub-categories/extra - standalone sub-categories not in products
 router.get("/sub-categories/extra", authMiddleware, async (req, res) => {
   try {
+    const cached = cache.get("sub_categories_extra");
+    if (cached) return res.json(cached);
+
     const productSubCats = await Product.distinct("subCategory");
-    const extra = await SubCategory.find({ name: { $nin: productSubCats.filter(Boolean) } });
-    res.json(extra.map((s) => ({ name: s.name, count: 0, _id: s._id })));
+    const extra = await SubCategory.find({ name: { $nin: productSubCats.filter(Boolean) } }).lean();
+    const result = extra.map((s) => ({ name: s.name, count: 0, _id: s._id }));
+    cache.set("sub_categories_extra", result, 300);
+    res.json(result);
   } catch {
+    res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+// GET /api/admin/sub-categories/overview - Consolidated single endpoint for sub-categories page
+router.get("/sub-categories/overview", authMiddleware, async (req, res) => {
+  try {
+    const cached = cache.get("sub_categories_overview");
+    if (cached) return res.json(cached);
+
+    const [productAgg, extraSubCats, settings, maxDoc] = await Promise.all([
+      Product.aggregate([
+        { $match: { category: { $ne: null, $exists: true } } },
+        { $group: { _id: "$category", count: { $sum: 1 } } },
+        { $sort: { _id: 1 } },
+      ]),
+      SubCategory.find().lean(),
+      SubCategorySettings.find().lean(),
+      SubCategorySettings.findOne({ category: "__config__", subCategory: "__max__" }).lean(),
+    ]);
+
+    const fromProducts = productAgg.map((r) => ({ category: r._id, name: r._id, count: r.count }));
+    const names = new Set(fromProducts.map((c) => c.name));
+    const extra = extraSubCats
+      .filter((s) => !names.has(s.name))
+      .map((s) => ({ category: s.name, name: s.name, count: 0, _id: s._id }));
+
+    const items = [...fromProducts, ...extra];
+    const max = maxDoc ? maxDoc.order : 4;
+
+    const payload = { items, settings, max };
+    cache.set("sub_categories_overview", payload, 300);
+    res.json(payload);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "خطأ في الخادم" });
+  }
+});
+
+// GET /api/admin/category-items/overview - Consolidated single endpoint for category-items page
+router.get("/category-items/overview", authMiddleware, async (req, res) => {
+  try {
+    const cached = cache.get("category_items_overview");
+    if (cached) return res.json(cached);
+
+    const [productAgg, customImages, settings, maxDoc] = await Promise.all([
+      Product.aggregate([
+        { $match: { category: { $ne: null, $exists: true } } },
+        { $sort: { createdAt: -1 } },
+        { $group: { _id: "$category", count: { $sum: 1 }, image: { $first: "$image" } } },
+      ]),
+      SubCategorySettings.find({ image: { $ne: "", $exists: true } }).select("category image").lean(),
+      SubCategorySettings.find().lean(),
+      SubCategorySettings.findOne({ category: "__config__", subCategory: "__max__" }).lean(),
+    ]);
+
+    const imageMap = new Map(customImages.map((s) => [s.category, s.image]));
+    const categories = productAgg.map((r) => ({
+      name: r._id,
+      count: r.count,
+      image: imageMap.get(r._id) || r.image || "",
+    }));
+
+    const items = productAgg.map((r) => ({ category: r._id, name: r._id, count: r.count }));
+    const max = maxDoc ? maxDoc.order : 4;
+
+    const payload = { items, settings, max, categories };
+    cache.set("category_items_overview", payload, 300);
+    res.json(payload);
+  } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -483,12 +585,17 @@ router.get("/sub-categories/extra", authMiddleware, async (req, res) => {
 // GET /api/admin/sub-categories
 router.get("/sub-categories", authMiddleware, async (req, res) => {
   try {
+    const cached = cache.get("sub_categories_list");
+    if (cached) return res.json(cached);
+
     const result = await Product.aggregate([
       { $match: { category: { $ne: null, $exists: true } } },
       { $group: { _id: "$category", count: { $sum: 1 } } },
       { $sort: { _id: 1 } },
     ]);
-    res.json(result.map((r) => ({ category: r._id, name: r._id, count: r.count })));
+    const list = result.map((r) => ({ category: r._id, name: r._id, count: r.count }));
+    cache.set("sub_categories_list", list, 300);
+    res.json(list);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -504,6 +611,7 @@ router.put("/sub-categories/rename", authMiddleware, async (req, res) => {
       { $set: { subCategory: newName.trim(), category: (newCategory || oldCategory).trim() } }
     );
     await SubCategory.updateOne({ name: oldName }, { $set: { name: newName.trim() } });
+    invalidateCategoryCache();
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -518,6 +626,7 @@ router.delete("/sub-categories/remove", authMiddleware, async (req, res) => {
     await Product.updateMany({ category: name }, { $unset: { category: "" } });
     await SubCategorySettings.deleteMany({ category: name });
     await SubCategory.deleteOne({ name });
+    invalidateCategoryCache();
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -527,7 +636,11 @@ router.delete("/sub-categories/remove", authMiddleware, async (req, res) => {
 // GET /api/admin/sub-categories/settings
 router.get("/sub-categories/settings", authMiddleware, async (req, res) => {
   try {
-    const settings = await SubCategorySettings.find();
+    const cached = cache.get("categories_settings");
+    if (cached) return res.json(cached);
+
+    const settings = await SubCategorySettings.find().lean();
+    cache.set("categories_settings", settings, 300);
     res.json(settings);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -546,6 +659,7 @@ router.patch("/sub-categories/settings/toggle", authMiddleware, async (req, res)
       { $set: { showInHome: newValue } },
       { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
+    invalidateCategoryCache();
     res.json({ showInHome: doc.showInHome });
   } catch (err) {
     console.error(err);
@@ -563,6 +677,7 @@ router.patch("/sub-categories/settings/order", authMiddleware, async (req, res) 
       { $set: { order: Number(order) || 0 } },
       { upsert: true }
     );
+    invalidateCategoryCache();
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -572,16 +687,21 @@ router.patch("/sub-categories/settings/order", authMiddleware, async (req, res) 
 // GET /api/admin/sub-categories/public (public - categories from product.category only)
 router.get("/sub-categories/public", async (req, res) => {
   try {
+    const cached = cache.get("categories_public");
+    if (cached) return res.json(cached);
+
     const [result, customImages] = await Promise.all([
       Product.aggregate([
         { $match: { category: { $ne: null, $exists: true }, image: { $ne: "", $exists: true } } },
         { $sort: { createdAt: -1 } },
         { $group: { _id: "$category", count: { $sum: 1 }, image: { $first: "$image" } } },
       ]),
-      SubCategorySettings.find({ image: { $ne: "", $exists: true } }).select("category image"),
+      SubCategorySettings.find({ image: { $ne: "", $exists: true } }).select("category image").lean(),
     ]);
     const imageMap = new Map(customImages.map((s) => [s.category, s.image]));
-    res.json(result.map((r) => ({ name: r._id, count: r.count, image: imageMap.get(r._id) || r.image })));
+    const data = result.map((r) => ({ name: r._id, count: r.count, image: imageMap.get(r._id) || r.image }));
+    cache.set("categories_public", data, 300);
+    res.json(data);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -601,6 +721,7 @@ router.post("/sub-categories/settings/image", authMiddleware, upload.single("ima
       { $set: { image: result.secure_url } },
       { upsert: true, returnDocument: 'after', setDefaultsOnInsert: true }
     );
+    invalidateCategoryCache();
     res.json({ url: result.secure_url });
   } catch (err) {
     console.error(err);
@@ -611,7 +732,11 @@ router.post("/sub-categories/settings/image", authMiddleware, upload.single("ima
 // GET /api/admin/sub-categories/home-settings (public)
 router.get("/sub-categories/home-settings", async (req, res) => {
   try {
-    const settings = await SubCategorySettings.find({ category: { $ne: "__config__" } }).sort({ order: 1 });
+    const cached = cache.get("categories_home_settings");
+    if (cached) return res.json(cached);
+
+    const settings = await SubCategorySettings.find({ category: { $ne: "__config__" } }).sort({ order: 1 }).lean();
+    cache.set("categories_home_settings", settings, 300);
     res.json(settings);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -621,8 +746,13 @@ router.get("/sub-categories/home-settings", async (req, res) => {
 // GET /api/admin/sub-categories/max (public)
 router.get("/sub-categories/max", async (req, res) => {
   try {
-    const doc = await SubCategorySettings.findOne({ category: "__config__", subCategory: "__max__" });
-    res.json({ max: doc ? doc.order : 4 });
+    const cached = cache.get("categories_max");
+    if (cached !== null && cached !== undefined) return res.json(cached);
+
+    const doc = await SubCategorySettings.findOne({ category: "__config__", subCategory: "__max__" }).lean();
+    const data = { max: doc ? doc.order : 4 };
+    cache.set("categories_max", data, 300);
+    res.json(data);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -639,6 +769,7 @@ router.patch("/sub-categories/max", authMiddleware, async (req, res) => {
       { $set: { order: val, showInHome: false } },
       { upsert: true, returnDocument: 'after' }
     );
+    invalidateCategoryCache();
     res.json({ max: val });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1177,92 +1308,6 @@ router.delete("/category-banners/:category/:index", authMiddleware, async (req, 
     doc.banners.splice(index, 1);
     await doc.save();
     res.json({ success: true });
-  } catch {
-    res.status(500).json({ error: "خطأ في الخادم" });
-  }
-});
-
-// GET /api/admin/banks
-router.get("/banks", authMiddleware, async (req, res) => {
-  try {
-    const banks = await Bank.find().sort({ createdAt: -1 });
-    res.json(banks);
-  } catch {
-    res.status(500).json({ error: "خطأ في الخادم" });
-  }
-});
-
-// POST /api/admin/banks
-router.post("/banks", authMiddleware, upload.single("logo"), async (req, res) => {
-  try {
-    const { name, iban } = req.body;
-    if (!name || !iban) return res.status(400).json({ error: "اسم البنك والآيبان مطلوبان" });
-    let logo = "";
-    if (req.file) {
-      const result = await uploadToCloudinary(req.file.buffer, "banks");
-      logo = result.secure_url;
-    }
-    const bank = await Bank.create({ name, iban, logo });
-    res.status(201).json(bank);
-  } catch {
-    res.status(500).json({ error: "خطأ في الخادم" });
-  }
-});
-
-// PUT /api/admin/banks/:id
-router.put("/banks/:id", authMiddleware, upload.single("logo"), async (req, res) => {
-  try {
-    const bank = await Bank.findById(req.params.id);
-    if (!bank) return res.status(404).json({ error: "البنك غير موجود" });
-    const { name, iban } = req.body;
-    if (name) bank.name = name;
-    if (iban) bank.iban = iban;
-    if (req.file) {
-      await deleteFromCloudinary(bank.logo);
-      const result = await uploadToCloudinary(req.file.buffer, "banks");
-      bank.logo = result.secure_url;
-    }
-    await bank.save();
-    res.json(bank);
-  } catch {
-    res.status(500).json({ error: "خطأ في الخادم" });
-  }
-});
-
-// DELETE /api/admin/banks/:id
-router.delete("/banks/:id", authMiddleware, async (req, res) => {
-  try {
-    const bank = await Bank.findByIdAndDelete(req.params.id);
-    if (!bank) return res.status(404).json({ error: "البنك غير موجود" });
-    await deleteFromCloudinary(bank.logo);
-    res.json({ success: true });
-  } catch {
-    res.status(500).json({ error: "خطأ في الخادم" });
-  }
-});
-
-// GET /api/admin/card-field-settings
-router.get("/card-field-settings", async (req, res) => {
-  try {
-    let doc = await CardFieldSettings.findOne();
-    if (!doc) doc = await CardFieldSettings.create({});
-    res.json(doc);
-  } catch {
-    res.status(500).json({ error: "خطأ في الخادم" });
-  }
-});
-
-// PATCH /api/admin/card-field-settings
-router.patch("/card-field-settings", authMiddleware, async (req, res) => {
-  try {
-    const { field } = req.body;
-    if (!["showExpiryDate", "showCvv"].includes(field))
-      return res.status(400).json({ error: "حقل غير صحيح" });
-    let doc = await CardFieldSettings.findOne();
-    if (!doc) doc = await CardFieldSettings.create({});
-    doc[field] = !doc[field];
-    await doc.save();
-    res.json({ [field]: doc[field] });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
