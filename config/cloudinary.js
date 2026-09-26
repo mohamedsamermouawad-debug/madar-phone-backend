@@ -33,10 +33,10 @@ function makeImageUpload() { return imageUpload; }
 function makeFileUpload() { return fileUpload; }
 
 function uploadToCloudinary(buffer, folder, options = {}) {
+  const isRaw = options.resource_type === "raw";
   const defaultOptions = {
     folder,
-    quality: "auto",
-    fetch_format: "auto",
+    ...(isRaw ? {} : { quality: "auto", fetch_format: "auto" }),
     ...options,
   };
   return new Promise((resolve, reject) => {

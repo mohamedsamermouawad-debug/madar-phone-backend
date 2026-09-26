@@ -1555,7 +1555,12 @@ router.post("/company/footer-file/:key", authMiddleware, uploadDoc.single("file"
     let company = await Company.findOne();
     if (!company) company = await Company.create({});
     await deleteFromCloudinary(company[key], "raw");
-    const result = await uploadToCloudinary(req.file.buffer, "docs", { resource_type: "raw" });
+    const ext = req.file.originalname ? req.file.originalname.split(".").pop() : "pdf";
+    const filename = `doc_${key}_${Date.now()}.${ext}`;
+    const result = await uploadToCloudinary(req.file.buffer, "docs", {
+      resource_type: "raw",
+      public_id: filename,
+    });
     company[key] = result.secure_url;
     await company.save();
     cache.del("company_data");
@@ -1645,7 +1650,12 @@ router.post("/company/footer-items/file/:index", authMiddleware, uploadDoc.singl
     }
     const old = company.footerItems[index]?.file;
     await deleteFromCloudinary(old, "raw");
-    const result = await uploadToCloudinary(req.file.buffer, "docs", { resource_type: "raw" });
+    const ext = req.file.originalname ? req.file.originalname.split(".").pop() : "pdf";
+    const filename = `item_doc_${index}_${Date.now()}.${ext}`;
+    const result = await uploadToCloudinary(req.file.buffer, "docs", {
+      resource_type: "raw",
+      public_id: filename,
+    });
     company.footerItems[index].file = result.secure_url;
     company.markModified("footerItems");
     await company.save();
