@@ -10,8 +10,9 @@ const SubCategory = require("../models/SubCategory");
 const Review = require("../models/Review");
 const Checkout = require("../models/Checkout");
 const CategoryBanner = require("../models/CategoryBanner");
-const { makeImageUpload, makeFileUpload, uploadToCloudinary, deleteFromCloudinary } = require("../config/cloudinary");
+const { makeImageUpload, makeFileUpload, uploadToCloudinary, deleteFromCloudinary, deleteMultipleFromCloudinary } = require("../config/cloudinary");
 const authMiddleware = require("../middleware/auth");
+
 
 const rateLimit = require("express-rate-limit");
 const cache = require("../utils/cache");
@@ -1201,36 +1202,79 @@ router.post("/products", authMiddleware, async (req, res) => {
     const body = req.body;
     const productData = {};
 
-    const fields = ["name", "image", "category", "subCategory", "brand", "color", "storage", "network", "screenSize", "description", "deliveryTime"];
-    fields.forEach((f) => { if (body[f]) productData[f] = body[f]; });
+    const stringFields = [
+      "name", "brief", "image", "category", "subCategory", "brand",
+      "color", "storage", "network", "screenSize", "description", "deliveryTime", "overview"
+    ];
+    stringFields.forEach((f) => {
+      if (body[f] !== undefined && body[f] !== null) productData[f] = String(body[f]).trim();
+    });
 
     const numFields = ["originalPrice", "salePrice", "warrantyYears"];
-    numFields.forEach((f) => { if (body[f] !== undefined && body[f] !== "") productData[f] = Number(body[f]); });
+    numFields.forEach((f) => {
+      if (body[f] !== undefined && body[f] !== "" && body[f] !== null) productData[f] = Number(body[f]);
+    });
 
     const boolFields = ["freeDelivery", "taxIncluded", "inStock"];
-    boolFields.forEach((f) => { if (body[f] !== undefined) productData[f] = body[f] === "true" || body[f] === true; });
+    boolFields.forEach((f) => {
+      if (body[f] !== undefined) productData[f] = body[f] === "true" || body[f] === true;
+    });
 
-    if (body["installment.available"] !== undefined) {
+    if (body["installment.available"] !== undefined || body.installment !== undefined) {
+      const inst = body.installment || {};
       productData.installment = {
-        available: body["installment.available"] === "true",
-        downPayment: body["installment.downPayment"] ? Number(body["installment.downPayment"]) : undefined,
-        months: body["installment.months"] ? Number(body["installment.months"]) : undefined,
-        note: body["installment.note"] || "",
+        available: body["installment.available"] !== undefined
+          ? (body["installment.available"] === "true" || body["installment.available"] === true)
+          : (inst.available === "true" || inst.available === true),
+        downPayment: body["installment.downPayment"] ? Number(body["installment.downPayment"]) : (inst.downPayment ? Number(inst.downPayment) : undefined),
+        months: body["installment.months"] ? Number(body["installment.months"]) : (inst.months ? Number(inst.months) : undefined),
+        note: body["installment.note"] || inst.note || "",
       };
     }
 
     const specFields = ["screen", "processor", "ram", "storage", "rearCamera", "frontCamera", "battery", "batteryLife", "charging", "os", "extras"];
-    const specs = {};
-    specFields.forEach((f) => { if (body[`specs.${f}`]) specs[f] = body[`specs.${f}`]; });
+    const specs = body.specs && typeof body.specs === "object" ? { ...body.specs } : {};
+    specFields.forEach((f) => {
+      if (body[`specs.${f}`] !== undefined) specs[f] = body[`specs.${f}`];
+    });
     if (Object.keys(specs).length) productData.specs = specs;
 
-    if (Array.isArray(body.images)) productData.images = body.images;
+    if (Array.isArray(body.images)) productData.images = body.images.filter(Boolean);
+    if (Array.isArray(body.gallery)) productData.gallery = body.gallery.filter((g) => g && (g.url || g.caption));
+    if (Array.isArray(body.specifications)) productData.specifications = body.specifications;
+    if (Array.isArray(body.specGroups)) productData.specGroups = body.specGroups;
+    if (Array.isArray(body.variants)) productData.variants = body.variants;
 
-    if (body.colors) {
-      try { productData.colors = JSON.parse(body.colors); } catch { /* ignore */ }
+    if (body.rating && typeof body.rating === "object") {
+      productData.rating = {
+        average: Number(body.rating.average) || 0,
+        count: Number(body.rating.count) || 0,
+      };
     }
 
+    if (Array.isArray(body.reviews)) {
+      productData.reviews = body.reviews.filter((r) => r && r.name && r.comment).map((r) => ({
+        name: String(r.name).trim(),
+        rate: Number(r.rate) || 5,
+        comment: String(r.comment).trim(),
+        date: r.date ? String(r.date) : new Date().toISOString().split("T")[0],
+      }));
+    }
+
+    if (body.colors) {
+      try {
+        productData.colors = typeof body.colors === "string" ? JSON.parse(body.colors) : body.colors;
+      } catch { /* ignore */ }
+    }
+    if (body.features) productData.features = body.features;
+    if (body.detailedSpecs) productData.detailedSpecs = body.detailedSpecs;
+    if (body.sections) productData.sections = body.sections;
+
     const product = await Product.create(productData);
+
+    cache.delPrefix("products");
+    invalidateCategoryCache();
+
     res.status(201).json(product);
   } catch (err) {
     console.error("POST /products error:", err);
@@ -1238,12 +1282,63 @@ router.post("/products", authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/admin/products
+// GET /api/admin/products - with server pagination & filters
 router.get("/products", authMiddleware, async (req, res) => {
   try {
-    const products = await Product.find().sort({ createdAt: -1 }).select("name category originalPrice salePrice").lean();
-    res.json(products);
-  } catch {
+    const { page, limit, search, category, subCategory } = req.query;
+
+    const filter = {};
+    if (category && String(category).trim()) {
+      filter.category = String(category).trim();
+    }
+    if (subCategory && String(subCategory).trim()) {
+      filter.subCategory = String(subCategory).trim();
+    }
+    if (search && String(search).trim()) {
+      const escaped = String(search).trim().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+      filter.$or = [
+        { name: { $regex: escaped, $options: "i" } },
+        { category: { $regex: escaped, $options: "i" } },
+        { brand: { $regex: escaped, $options: "i" } },
+      ];
+    }
+
+    const projection = "name category subCategory originalPrice salePrice image inStock createdAt";
+
+    // If no page is passed, return full list for backwards compatibility
+    if (page === undefined && limit === undefined) {
+      const products = await Product.find(filter)
+        .sort({ createdAt: -1 })
+        .select(projection)
+        .lean({ virtuals: true });
+      return res.json(products);
+    }
+
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 10));
+    const skip = (pageNum - 1) * limitNum;
+
+    const [total, products] = await Promise.all([
+      Product.countDocuments(filter),
+      Product.find(filter)
+        .sort({ createdAt: -1 })
+        .select(projection)
+        .skip(skip)
+        .limit(limitNum)
+        .lean({ virtuals: true }),
+    ]);
+
+    const totalPages = Math.ceil(total / limitNum) || 1;
+
+    res.json({
+      products,
+      total,
+      page: pageNum,
+      totalPages,
+      limit: limitNum,
+    });
+  } catch (err) {
+    console.error("GET /admin/products error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1251,7 +1346,7 @@ router.get("/products", authMiddleware, async (req, res) => {
 // GET /api/admin/products/:id
 router.get("/products/:id", authMiddleware, async (req, res) => {
   try {
-    const product = await Product.findById(req.params.id);
+    const product = await Product.findById(req.params.id).lean({ virtuals: true });
     if (!product) return res.status(404).json({ error: "المنتج غير موجود" });
     res.json(product);
   } catch {
@@ -1264,9 +1359,27 @@ router.delete("/products/:id", authMiddleware, async (req, res) => {
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
     if (!product) return res.status(404).json({ error: "المنتج غير موجود" });
-    await deleteFromCloudinary(product.image);
+
+    // Collect all image URLs for cleanup
+    const imagesToDelete = [];
+    if (product.image) imagesToDelete.push(product.image);
+    if (Array.isArray(product.images)) imagesToDelete.push(...product.images);
+    if (Array.isArray(product.gallery)) {
+      product.gallery.forEach((g) => { if (g && g.url) imagesToDelete.push(g.url); });
+    }
+
+    if (imagesToDelete.length) {
+      deleteMultipleFromCloudinary(imagesToDelete).catch((e) =>
+        console.error("Error deleting product images:", e.message)
+      );
+    }
+
+    cache.delPrefix("products");
+    invalidateCategoryCache();
+
     res.json({ success: true });
-  } catch {
+  } catch (err) {
+    console.error("DELETE /admin/products/:id error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1278,48 +1391,116 @@ router.put("/products/:id", authMiddleware, async (req, res) => {
     if (!product) return res.status(404).json({ error: "المنتج غير موجود" });
 
     const body = req.body;
-    const fields = ["name", "category", "subCategory", "brand", "color", "storage", "network", "screenSize", "description", "deliveryTime"];
-    fields.forEach((f) => { if (body[f] !== undefined) product[f] = body[f]; });
+    const stringFields = [
+      "name", "brief", "category", "subCategory", "brand",
+      "color", "storage", "network", "screenSize", "description", "deliveryTime", "overview"
+    ];
+    stringFields.forEach((f) => {
+      if (body[f] !== undefined) product[f] = body[f] !== null ? String(body[f]).trim() : "";
+    });
 
     const numFields = ["originalPrice", "salePrice", "warrantyYears"];
-    numFields.forEach((f) => { if (body[f] !== undefined) product[f] = body[f] === "" ? undefined : Number(body[f]); });
+    numFields.forEach((f) => {
+      if (body[f] !== undefined) product[f] = (body[f] === "" || body[f] === null) ? undefined : Number(body[f]);
+    });
 
     const boolFields = ["freeDelivery", "taxIncluded", "inStock"];
-    boolFields.forEach((f) => { if (body[f] !== undefined) product[f] = body[f] === "true" || body[f] === true; });
+    boolFields.forEach((f) => {
+      if (body[f] !== undefined) product[f] = body[f] === "true" || body[f] === true;
+    });
 
-    if (body["installment.available"] !== undefined) {
-      const hasInstallment = product.installment && typeof product.installment === "object";
-      const inst = hasInstallment
-        ? (typeof product.installment.toObject === "function" ? product.installment.toObject() : { ...product.installment })
-        : {};
-      inst.available = body["installment.available"] === "true" || body["installment.available"] === true;
-      inst.downPayment = body["installment.downPayment"] ? Number(body["installment.downPayment"]) : inst.downPayment;
-      inst.months = body["installment.months"] ? Number(body["installment.months"]) : inst.months;
-      inst.note = body["installment.note"] ?? inst.note;
+    if (body["installment.available"] !== undefined || body.installment !== undefined) {
+      const inst = body.installment && typeof body.installment === "object"
+        ? body.installment
+        : (product.installment ? (typeof product.installment.toObject === "function" ? product.installment.toObject() : { ...product.installment }) : {});
+
+      inst.available = body["installment.available"] !== undefined
+        ? (body["installment.available"] === "true" || body["installment.available"] === true)
+        : (inst.available === "true" || inst.available === true);
+
+      if (body["installment.downPayment"] !== undefined) inst.downPayment = body["installment.downPayment"] ? Number(body["installment.downPayment"]) : undefined;
+      if (body["installment.months"] !== undefined) inst.months = body["installment.months"] ? Number(body["installment.months"]) : undefined;
+      if (body["installment.note"] !== undefined) inst.note = body["installment.note"] ?? inst.note;
+
       product.installment = inst;
       product.markModified("installment");
     }
 
     const specFields = ["screen", "processor", "ram", "storage", "rearCamera", "frontCamera", "battery", "batteryLife", "charging", "os", "extras"];
-    const hasSpecs = specFields.some((f) => body[`specs.${f}`] !== undefined);
+    const hasSpecs = specFields.some((f) => body[`specs.${f}`] !== undefined) || body.specs !== undefined;
     if (hasSpecs) {
       const hasSpecsObject = product.specs && typeof product.specs === "object";
-      const specs = hasSpecsObject
-        ? (typeof product.specs.toObject === "function" ? product.specs.toObject() : { ...product.specs })
-        : {};
-      specFields.forEach((f) => { if (body[`specs.${f}`] !== undefined) specs[f] = body[`specs.${f}`]; });
+      const specs = body.specs && typeof body.specs === "object"
+        ? { ...body.specs }
+        : (hasSpecsObject ? (typeof product.specs.toObject === "function" ? product.specs.toObject() : { ...product.specs }) : {});
+
+      specFields.forEach((f) => {
+        if (body[`specs.${f}`] !== undefined) specs[f] = body[`specs.${f}`];
+      });
       product.specs = specs;
       product.markModified("specs");
     }
 
-    if (Array.isArray(body.images)) product.images = body.images;
+    if (Array.isArray(body.images)) {
+      product.images = body.images.filter(Boolean);
+      product.markModified("images");
+    }
     if (body.image !== undefined) product.image = body.image;
 
-    if (body.colors !== undefined) {
-      try { product.colors = JSON.parse(body.colors); } catch { /* ignore */ }
+    if (Array.isArray(body.gallery)) {
+      product.gallery = body.gallery.filter((g) => g && (g.url || g.caption));
+      product.markModified("gallery");
     }
 
+    if (Array.isArray(body.specifications)) {
+      product.specifications = body.specifications;
+      product.markModified("specifications");
+    }
+
+    if (Array.isArray(body.specGroups)) {
+      product.specGroups = body.specGroups;
+      product.markModified("specGroups");
+    }
+
+    if (Array.isArray(body.variants)) {
+      product.variants = body.variants;
+      product.markModified("variants");
+    }
+
+    if (body.rating && typeof body.rating === "object") {
+      product.rating = {
+        average: Number(body.rating.average) || 0,
+        count: Number(body.rating.count) || 0,
+      };
+      product.markModified("rating");
+    }
+
+    if (Array.isArray(body.reviews)) {
+      product.reviews = body.reviews.filter((r) => r && r.name && r.comment).map((r) => ({
+        name: String(r.name).trim(),
+        rate: Number(r.rate) || 5,
+        comment: String(r.comment).trim(),
+        date: r.date ? String(r.date) : new Date().toISOString().split("T")[0],
+      }));
+      product.markModified("reviews");
+    }
+
+    if (body.colors !== undefined) {
+      try {
+        product.colors = typeof body.colors === "string" ? JSON.parse(body.colors) : body.colors;
+        product.markModified("colors");
+      } catch { /* ignore */ }
+    }
+
+    if (body.features !== undefined) { product.features = body.features; product.markModified("features"); }
+    if (body.detailedSpecs !== undefined) { product.detailedSpecs = body.detailedSpecs; product.markModified("detailedSpecs"); }
+    if (body.sections !== undefined) { product.sections = body.sections; product.markModified("sections"); }
+
     await product.save();
+
+    cache.delPrefix("products");
+    invalidateCategoryCache();
+
     res.json(product);
   } catch (err) {
     console.error("PUT /products/:id error:", err);

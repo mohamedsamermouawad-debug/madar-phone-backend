@@ -1,33 +1,36 @@
 const Product = require("../models/Product");
 const cache = require("../utils/cache");
-
-function normalizeArabic(str) {
-  if (!str) return "";
-  return str
-    .replace(/[أإآا]/g, "ا")
-    .replace(/[ىي]/g, "ي")
-    .replace(/ة/g, "ه")
-    .replace(/ؤ/g, "و")
-    .replace(/ئ/g, "ي");
-}
+const { deleteMultipleFromCloudinary } = require("../config/cloudinary");
 
 function escapeRegex(text) {
   return text.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
 }
 
 const LIST_PROJECTION = {
-  name: 1, image: 1, category: 1, subCategory: 1, brand: 1, color: 1, storage: 1,
+  name: 1, image: 1, images: 1, category: 1, subCategory: 1, brand: 1, color: 1, storage: 1,
   salePrice: 1, originalPrice: 1, inStock: 1, freeDelivery: 1, deliveryTime: 1,
-  warrantyYears: 1, installment: 1, taxIncluded: 1, colors: 1,
-  "variants.defaultStorage": 1,
+  warrantyYears: 1, installment: 1, taxIncluded: 1, colors: 1, variants: 1,
+  createdAt: 1,
 };
 const LEAN_VIRTUALS = { virtuals: true };
 
+function invalidateProductAndCategoryCache() {
+  cache.delPrefix("products");
+  cache.delPrefix("categories_");
+  cache.delPrefix("sub_categories_");
+  cache.delPrefix("category_items_");
+  cache.delPrefix("main_categories_");
+}
+
 exports.getProducts = async (req, res) => {
   try {
-    const { q, brand, mainCategory, category, subCategory, page, limit } = req.query;
+    const { q, brand, mainCategory, category, subCategory, excludeId, page, limit } = req.query;
 
     const filter = {};
+
+    if (excludeId) {
+      filter._id = { $ne: excludeId };
+    }
 
     if (brand) {
       filter.brand = { $regex: `^${escapeRegex(brand.trim())}$`, $options: "i" };
@@ -80,13 +83,33 @@ exports.getProduct = async (req, res) => {
   }
 };
 
-function invalidateProductAndCategoryCache() {
-  cache.delPrefix("products");
-  cache.delPrefix("categories_");
-  cache.delPrefix("sub_categories_");
-  cache.delPrefix("category_items_");
-  cache.delPrefix("main_categories_");
-}
+exports.getSimilarProducts = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { category, subCategory, limit = 8 } = req.query;
+
+    const filter = { _id: { $ne: id } };
+    const orConditions = [];
+    if (subCategory) orConditions.push({ subCategory });
+    if (category) orConditions.push({ category });
+
+    if (orConditions.length) {
+      filter.$or = orConditions;
+    }
+
+    const limitNum = Math.min(20, Math.max(1, parseInt(limit) || 8));
+    const products = await Product.find(filter)
+      .select(LIST_PROJECTION)
+      .sort({ createdAt: -1 })
+      .limit(limitNum)
+      .lean(LEAN_VIRTUALS);
+
+    res.json(products);
+  } catch (err) {
+    console.error("getSimilarProducts error:", err.message);
+    res.status(500).json({ message: "خطأ في الخادم" });
+  }
+};
 
 exports.createProduct = async (req, res) => {
   try {
@@ -113,9 +136,25 @@ exports.deleteProduct = async (req, res) => {
   try {
     const product = await Product.findByIdAndDelete(req.params.id);
     if (!product) return res.status(404).json({ message: "Product not found" });
+
+    // Collect all image URLs for cleanup
+    const imagesToDelete = [];
+    if (product.image) imagesToDelete.push(product.image);
+    if (Array.isArray(product.images)) imagesToDelete.push(...product.images);
+    if (Array.isArray(product.gallery)) {
+      product.gallery.forEach((g) => { if (g && g.url) imagesToDelete.push(g.url); });
+    }
+
+    if (imagesToDelete.length) {
+      deleteMultipleFromCloudinary(imagesToDelete).catch((e) =>
+        console.error("Error deleting product images:", e.message)
+      );
+    }
+
     invalidateProductAndCategoryCache();
     res.json({ message: "Product deleted" });
   } catch (err) {
     res.status(500).json({ message: "خطأ في الخادم" });
   }
 };
+
