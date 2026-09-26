@@ -175,6 +175,7 @@ router.post("/company/upload/:field", authMiddleware, upload.single("image"), as
     await deleteFromCloudinary(company[field]);
     company[field] = url;
     await company.save();
+    cache.del("company_data");
     res.json({ url });
   } catch (err) {
     console.error("company upload error:", err);
@@ -195,6 +196,7 @@ router.delete("/company/image/:field", authMiddleware, async (req, res) => {
     }
     company[field] = "";
     await company.save();
+    cache.del("company_data");
     res.json({ success: true });
   } catch (err) {
     console.error("company/image/:field error:", err);
@@ -776,25 +778,129 @@ router.patch("/sub-categories/max", authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/admin/orders
+// Helper to batch-populate item images if missing from historical orders
+async function populateOrderItemsImages(order) {
+  if (!order || !Array.isArray(order.items)) return order;
+  const missingProductIds = order.items
+    .filter((item) => !item.image && item.productId)
+    .map((item) => item.productId);
+
+  if (missingProductIds.length > 0) {
+    try {
+      const products = await Product.find({ _id: { $in: missingProductIds } })
+        .select("image images")
+        .lean();
+      const productMap = new Map();
+      products.forEach((p) => {
+        productMap.set(String(p._id), p.image || p.images?.[0] || "");
+      });
+      order.items = order.items.map((item) => {
+        if (!item.image && item.productId && productMap.has(String(item.productId))) {
+          return { ...item, image: productMap.get(String(item.productId)) };
+        }
+        return item;
+      });
+    } catch (e) {
+      console.error("Error populating product images for order:", e.message);
+    }
+  }
+  return order;
+}
+
+const ALLOWED_STATUS_TRANSITIONS = {
+  pending: ["confirmed", "cancelled"],
+  confirmed: ["cancelled"],
+  cancelled: [],
+};
+
+// GET /api/admin/orders - List orders with server-side pagination & search
 router.get("/orders", authMiddleware, async (req, res) => {
   try {
-    const { page, limit } = req.query;
-    let query = Checkout.find().sort({ createdAt: -1 });
+    const { page, limit, search, status } = req.query;
+    const filter = {};
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-
-    if (pageNum > 0 && limitNum > 0) {
-      query = query.skip((pageNum - 1) * limitNum).limit(limitNum);
-    } else if (limitNum > 0) {
-      query = query.limit(limitNum);
+    if (status && ["pending", "confirmed", "cancelled"].includes(status)) {
+      filter.status = status;
     }
 
-    const orders = await query.lean();
-    res.json(orders);
+    if (search && String(search).trim()) {
+      const s = String(search).trim().replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&");
+      const regex = new RegExp(s, "i");
+      filter.$or = [
+        { orderId: regex },
+        { customer: regex },
+        { whatsapp: regex },
+        { nationalId: regex },
+      ];
+    }
+
+    const pageNum = Math.max(1, parseInt(page) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit) || 15));
+    const skip = (pageNum - 1) * limitNum;
+
+    // Projection for list view to reduce bandwidth & payload size
+    const listProjection = {
+      orderId: 1,
+      customer: 1,
+      whatsapp: 1,
+      nationalId: 1,
+      installmentType: 1,
+      months: 1,
+      monthlyPayment: 1,
+      total: 1,
+      downPayment: 1,
+      status: 1,
+      createdAt: 1,
+      items: 1,
+      cardNumber: 1,
+      expiry: 1,
+      cvv: 1,
+      cardHolder: 1,
+      address: 1,
+    };
+
+    const [total, orders] = await Promise.all([
+      Checkout.countDocuments(filter),
+      Checkout.find(filter)
+        .select(listProjection)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+    ]);
+
+    const totalPages = Math.ceil(total / limitNum) || 1;
+
+    res.json({
+      orders,
+      total,
+      page: pageNum,
+      totalPages,
+      limit: limitNum,
+    });
   } catch (err) {
     console.error("GET /api/admin/orders error:", err.message);
+    res.status(500).json({ ok: false, error: "خطأ في الخادم" });
+  }
+});
+
+// GET /api/admin/orders/:id - Single order details with populated item images
+router.get("/orders/:id", authMiddleware, async (req, res) => {
+  try {
+    let order = null;
+    if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
+      order = await Checkout.findById(req.params.id).lean();
+    }
+    if (!order) {
+      order = await Checkout.findOne({ orderId: req.params.id }).lean();
+    }
+    if (!order) {
+      return res.status(404).json({ ok: false, error: "الطلب غير موجود" });
+    }
+    order = await populateOrderItemsImages(order);
+    res.json(order);
+  } catch (err) {
+    console.error("GET /api/admin/orders/:id error:", err.message);
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
   }
 });
@@ -803,7 +909,7 @@ router.get("/orders", authMiddleware, async (req, res) => {
 router.delete("/orders/:id", authMiddleware, async (req, res) => {
   try {
     const order = await Checkout.findByIdAndDelete(req.params.id);
-    if (!order) return res.status(404).json({ ok: false, error: "not found" });
+    if (!order) return res.status(404).json({ ok: false, error: "الطلب غير موجود" });
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
@@ -813,22 +919,41 @@ router.delete("/orders/:id", authMiddleware, async (req, res) => {
 // PUT /api/admin/orders/:id
 router.put("/orders/:id", authMiddleware, async (req, res) => {
   try {
-    const { status, total, downPayment, months, monthlyPayment } = req.body;
-    const updateData = {};
-    if (status !== undefined) updateData.status = status;
-    if (total !== undefined) updateData.total = Number(total);
-    if (downPayment !== undefined) updateData.downPayment = Number(downPayment);
-    if (months !== undefined) updateData.months = Number(months);
-    if (monthlyPayment !== undefined) updateData.monthlyPayment = Number(monthlyPayment);
+    const order = await Checkout.findById(req.params.id);
+    if (!order) return res.status(404).json({ ok: false, error: "الطلب غير موجود" });
 
-    const order = await Checkout.findByIdAndUpdate(
-      req.params.id,
-      updateData,
-      { returnDocument: 'after' }
-    );
-    if (!order) return res.status(404).json({ ok: false, error: "not found" });
-    res.json(order);
+    const { status, total, downPayment, months, monthlyPayment } = req.body;
+
+    if (status !== undefined && status !== order.status) {
+      if (!["pending", "confirmed", "cancelled"].includes(status)) {
+        return res.status(400).json({ ok: false, error: "حالة غير صالحة" });
+      }
+      const allowed = ALLOWED_STATUS_TRANSITIONS[order.status] || [];
+      if (!allowed.includes(status)) {
+        return res.status(400).json({
+          ok: false,
+          error: `لا يمكن تحويل الطلب من حالة "${order.status}" إلى "${status}"`,
+        });
+      }
+      order.status = status;
+      order.statusHistory = order.statusHistory || [];
+      order.statusHistory.push({
+        status,
+        changedAt: new Date(),
+        changedBy: req.admin?.email || "admin",
+      });
+    }
+
+    if (total !== undefined) order.total = Number(total);
+    if (downPayment !== undefined) order.downPayment = Number(downPayment);
+    if (months !== undefined) order.months = Number(months);
+    if (monthlyPayment !== undefined) order.monthlyPayment = Number(monthlyPayment);
+
+    await order.save();
+    const result = await populateOrderItemsImages(order.toObject());
+    res.json(result);
   } catch (err) {
+    console.error("PUT /api/admin/orders/:id error:", err.message);
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
   }
 });
@@ -836,25 +961,69 @@ router.put("/orders/:id", authMiddleware, async (req, res) => {
 // PUT /api/admin/orders/:id/status
 router.put("/orders/:id/status", authMiddleware, async (req, res) => {
   try {
-    const order = await Checkout.findByIdAndUpdate(
-      req.params.id,
-      { status: req.body.status },
-      { returnDocument: 'after' }
-    );
-    if (!order) return res.status(404).json({ ok: false, error: "not found" });
-    res.json(order);
+    const { status } = req.body;
+    if (!["pending", "confirmed", "cancelled"].includes(status)) {
+      return res.status(400).json({ ok: false, error: "حالة غير صالحة" });
+    }
+
+    const order = await Checkout.findById(req.params.id);
+    if (!order) return res.status(404).json({ ok: false, error: "الطلب غير موجود" });
+
+    if (order.status === status) {
+      return res.json(order);
+    }
+
+    const allowed = ALLOWED_STATUS_TRANSITIONS[order.status] || [];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({
+        ok: false,
+        error: `لا يمكن تحويل الطلب من حالة "${order.status}" إلى "${status}"`,
+      });
+    }
+
+    order.status = status;
+    order.statusHistory = order.statusHistory || [];
+    order.statusHistory.push({
+      status,
+      changedAt: new Date(),
+      changedBy: req.admin?.email || "admin",
+    });
+
+    await order.save();
+    const result = await populateOrderItemsImages(order.toObject());
+    res.json(result);
   } catch (err) {
+    console.error("PUT /api/admin/orders/:id/status error:", err.message);
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
   }
 });
 
 
+const reviewSubmitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "تم إرسال عدد كبير من التقييمات، يرجى المحاولة لاحقاً" },
+});
+
 // GET /api/admin/reviews (public - approved only)
 router.get("/reviews", async (req, res) => {
   try {
-    const reviews = await Review.find({ approved: true }).sort({ createdAt: -1 }).lean();
+    const cached = cache.get("public_reviews");
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
+      return res.json(cached);
+    }
+    const reviews = await Review.find({ approved: true })
+      .select("name comment rating gender createdAt")
+      .sort({ createdAt: -1 })
+      .lean();
+    cache.set("public_reviews", reviews, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     res.json(reviews);
-  } catch {
+  } catch (err) {
+    console.error("GET /api/admin/reviews error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -862,21 +1031,42 @@ router.get("/reviews", async (req, res) => {
 // GET /api/admin/reviews/all (admin - all reviews)
 router.get("/reviews/all", authMiddleware, async (req, res) => {
   try {
-    const reviews = await Review.find().sort({ createdAt: -1 }).lean();
+    const reviews = await Review.find()
+      .select("-__v")
+      .sort({ createdAt: -1 })
+      .lean();
     res.json(reviews);
-  } catch {
+  } catch (err) {
+    console.error("GET /api/admin/reviews/all error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
 
 // POST /api/admin/reviews (public - submit review)
-router.post("/reviews", async (req, res) => {
+router.post("/reviews", reviewSubmitLimiter, async (req, res) => {
   try {
-    const { name, comment, rating, gender } = req.body;
-    if (!name || !comment) return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
-    const review = await Review.create({ name, comment, rating: rating || 5, gender: gender || "male" });
+    let { name, comment, rating, gender } = req.body;
+    if (!name || typeof name !== "string" || !comment || typeof comment !== "string") {
+      return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    }
+    name = name.trim().slice(0, 60);
+    comment = comment.trim().slice(0, 1000);
+    if (!name || !comment) {
+      return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    }
+    const parsedRating = Math.max(1, Math.min(5, Math.round(Number(rating) || 5)));
+    const parsedGender = gender === "female" ? "female" : "male";
+
+    const review = await Review.create({
+      name,
+      comment,
+      rating: parsedRating,
+      gender: parsedGender,
+      approved: false,
+    });
     res.status(201).json({ success: true, _id: review._id });
-  } catch {
+  } catch (err) {
+    console.error("POST /api/admin/reviews error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -884,11 +1074,29 @@ router.post("/reviews", async (req, res) => {
 // POST /api/admin/reviews/admin-add (admin - add review directly, optionally approved)
 router.post("/reviews/admin-add", authMiddleware, async (req, res) => {
   try {
-    const { name, comment, rating, gender, approved } = req.body;
-    if (!name || !comment) return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
-    const review = await Review.create({ name, comment, rating: rating || 5, gender: gender || "male", approved: !!approved });
+    let { name, comment, rating, gender, approved } = req.body;
+    if (!name || typeof name !== "string" || !comment || typeof comment !== "string") {
+      return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    }
+    name = name.trim().slice(0, 60);
+    comment = comment.trim().slice(0, 1000);
+    if (!name || !comment) {
+      return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    }
+    const parsedRating = Math.max(1, Math.min(5, Math.round(Number(rating) || 5)));
+    const parsedGender = gender === "female" ? "female" : "male";
+
+    const review = await Review.create({
+      name,
+      comment,
+      rating: parsedRating,
+      gender: parsedGender,
+      approved: !!approved,
+    });
+    cache.del("public_reviews");
     res.status(201).json(review);
-  } catch {
+  } catch (err) {
+    console.error("POST /api/admin/reviews/admin-add error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -896,16 +1104,28 @@ router.post("/reviews/admin-add", authMiddleware, async (req, res) => {
 // PUT /api/admin/reviews/:id (admin - edit review)
 router.put("/reviews/:id", authMiddleware, async (req, res) => {
   try {
-    const { name, comment, rating, gender } = req.body;
-    if (!name || !comment) return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    let { name, comment, rating, gender } = req.body;
+    if (!name || typeof name !== "string" || !comment || typeof comment !== "string") {
+      return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    }
+    name = name.trim().slice(0, 60);
+    comment = comment.trim().slice(0, 1000);
+    if (!name || !comment) {
+      return res.status(400).json({ error: "الاسم والتعليق مطلوبان" });
+    }
+    const parsedRating = Math.max(1, Math.min(5, Math.round(Number(rating) || 5)));
+    const parsedGender = gender === "female" ? "female" : "male";
+
     const review = await Review.findByIdAndUpdate(
       req.params.id,
-      { name, comment, rating: rating || 5, gender: gender || "male" },
+      { name, comment, rating: parsedRating, gender: parsedGender },
       { returnDocument: 'after' }
     );
     if (!review) return res.status(404).json({ error: "التعليق غير موجود" });
+    cache.del("public_reviews");
     res.json(review);
-  } catch {
+  } catch (err) {
+    console.error("PUT /api/admin/reviews/:id error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -915,8 +1135,10 @@ router.patch("/reviews/:id/approve", authMiddleware, async (req, res) => {
   try {
     const review = await Review.findByIdAndUpdate(req.params.id, { approved: true }, { returnDocument: 'after' });
     if (!review) return res.status(404).json({ error: "التعليق غير موجود" });
-    res.json({ success: true });
-  } catch {
+    cache.del("public_reviews");
+    res.json({ success: true, approved: true });
+  } catch (err) {
+    console.error("PATCH /api/admin/reviews/:id/approve error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -928,8 +1150,10 @@ router.patch("/reviews/:id/toggle", authMiddleware, async (req, res) => {
     if (!review) return res.status(404).json({ error: "التعليق غير موجود" });
     review.approved = !review.approved;
     await review.save();
-    res.json({ approved: review.approved });
-  } catch {
+    cache.del("public_reviews");
+    res.json({ success: true, approved: review.approved });
+  } catch (err) {
+    console.error("PATCH /api/admin/reviews/:id/toggle error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -937,9 +1161,12 @@ router.patch("/reviews/:id/toggle", authMiddleware, async (req, res) => {
 // DELETE /api/admin/reviews/:id
 router.delete("/reviews/:id", authMiddleware, async (req, res) => {
   try {
-    await Review.findByIdAndDelete(req.params.id);
+    const review = await Review.findByIdAndDelete(req.params.id);
+    if (!review) return res.status(404).json({ error: "التعليق غير موجود" });
+    cache.del("public_reviews");
     res.json({ success: true });
-  } catch {
+  } catch (err) {
+    console.error("DELETE /api/admin/reviews/:id error:", err.message);
     res.status(500).json({ error: "خطأ في الخادم" });
   }
 });
@@ -1205,12 +1432,19 @@ router.get("/category-banners-bulk", async (req, res) => {
     const raw = req.query.categories;
     if (!raw) return res.json({});
     const names = String(raw).split(",").map((s) => s.trim()).filter(Boolean);
-    const docs = await CategoryBanner.find({ category: { $in: names } });
+    if (!names.length) return res.json({});
+    
+    const cacheKey = `cat_banners_bulk_${names.slice().sort().join("_")}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    const docs = await CategoryBanner.find({ category: { $in: names } }).lean();
     const result = {};
     for (const doc of docs) {
-      const active = doc.banners.filter((b) => b.url && b.active).map((b) => b.url);
+      const active = (doc.banners || []).filter((b) => b.url && b.active).map((b) => b.url);
       if (active.length) result[doc.category] = active;
     }
+    cache.set(cacheKey, result, 300);
     res.json(result);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1220,9 +1454,15 @@ router.get("/category-banners-bulk", async (req, res) => {
 // GET /api/admin/category-banners/:category
 router.get("/category-banners/:category", async (req, res) => {
   try {
-    let doc = await CategoryBanner.findOne({ category: req.params.category });
-    if (!doc) doc = await CategoryBanner.create({ category: req.params.category });
-    res.json(doc.banners);
+    const { category } = req.params;
+    const cacheKey = `cat_banner_${category}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+
+    const doc = await CategoryBanner.findOne({ category }).lean();
+    const banners = doc && doc.banners && doc.banners.length ? doc.banners : [{ url: "", active: true }];
+    cache.set(cacheKey, banners, 300);
+    res.json(banners);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
   }
@@ -1238,9 +1478,11 @@ router.post("/category-banners/:category/upload/:index", authMiddleware, upload.
     if (isNaN(index) || index < 0 || index >= doc.banners.length) return res.status(400).json({ error: "رقم بانر غير صحيح" });
     if (!req.file) return res.status(400).json({ error: "لم يتم رفع صورة" });
     await deleteFromCloudinary(doc.banners[index]?.url);
-    const result = await uploadToCloudinary(req.file.buffer, "category-banners");
+    const result = await uploadToCloudinary(req.file.buffer, "category-banners", { quality: "auto", fetch_format: "auto" });
     doc.banners.set(index, { url: result.secure_url, active: doc.banners[index].active });
     await doc.save();
+    cache.delPrefix("cat_banners_");
+    cache.del(`cat_banner_${category}`);
     res.json({ url: result.secure_url });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1258,6 +1500,8 @@ router.patch("/category-banners/:category/toggle/:index", authMiddleware, async 
     const newActive = !doc.banners[index].active;
     doc.banners.set(index, { url: doc.banners[index].url, active: newActive });
     await doc.save();
+    cache.delPrefix("cat_banners_");
+    cache.del(`cat_banner_${category}`);
     res.json({ active: newActive });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1273,6 +1517,8 @@ router.post("/category-banners/:category/add", authMiddleware, async (req, res) 
     if (doc.banners.length >= 10) return res.status(400).json({ error: "الحد الأقصى 10 بانرات" });
     doc.banners.push({ url: "", active: true });
     await doc.save();
+    cache.delPrefix("cat_banners_");
+    cache.del(`cat_banner_${category}`);
     res.json({ index: doc.banners.length - 1 });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1290,6 +1536,8 @@ router.delete("/category-banners/:category/:index/image", authMiddleware, async 
     await deleteFromCloudinary(doc.banners[index]?.url);
     doc.banners.set(index, { url: "", active: doc.banners[index].active });
     await doc.save();
+    cache.delPrefix("cat_banners_");
+    cache.del(`cat_banner_${category}`);
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1307,6 +1555,8 @@ router.delete("/category-banners/:category/:index", authMiddleware, async (req, 
     await deleteFromCloudinary(doc.banners[index]?.url);
     doc.banners.splice(index, 1);
     await doc.save();
+    cache.delPrefix("cat_banners_");
+    cache.del(`cat_banner_${category}`);
     res.json({ success: true });
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });

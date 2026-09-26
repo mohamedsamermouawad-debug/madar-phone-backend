@@ -4,6 +4,42 @@ const rateLimit = require("express-rate-limit");
 const Checkout = require("../models/Checkout");
 const authMiddleware = require("../middleware/auth");
 
+const Product = require("../models/Product");
+
+const ALLOWED_STATUS_TRANSITIONS = {
+  pending: ["confirmed", "cancelled"],
+  confirmed: ["cancelled"],
+  cancelled: [],
+};
+
+async function populateOrderItemsImages(order) {
+  if (!order || !Array.isArray(order.items)) return order;
+  const missingProductIds = order.items
+    .filter((item) => !item.image && item.productId)
+    .map((item) => item.productId);
+
+  if (missingProductIds.length > 0) {
+    try {
+      const products = await Product.find({ _id: { $in: missingProductIds } })
+        .select("image images")
+        .lean();
+      const productMap = new Map();
+      products.forEach((p) => {
+        productMap.set(String(p._id), p.image || p.images?.[0] || "");
+      });
+      order.items = order.items.map((item) => {
+        if (!item.image && item.productId && productMap.has(String(item.productId))) {
+          return { ...item, image: productMap.get(String(item.productId)) };
+        }
+        return item;
+      });
+    } catch (e) {
+      console.error("Error populating product images for order:", e.message);
+    }
+  }
+  return order;
+}
+
 const checkoutRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 15,
@@ -57,6 +93,7 @@ router.post("/", checkoutRateLimiter, async (req, res) => {
             quantity: Number(item.quantity) || 1,
             color: item.color,
             storage: item.storage,
+            image: item.image || "",
           }))
         : [],
       total: Number(total) || 0,
@@ -70,6 +107,13 @@ router.post("/", checkoutRateLimiter, async (req, res) => {
       months: Number(months) || 0,
       monthlyPayment: Number(monthlyPayment) || 0,
       status: "pending",
+      statusHistory: [
+        {
+          status: "pending",
+          changedAt: new Date(),
+          changedBy: "customer_checkout",
+        },
+      ],
       deviceIp,
     });
 
@@ -111,8 +155,15 @@ router.get("/", authMiddleware, async (req, res) => {
 // GET /api/checkout/:id - Single order
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
-    const order = await Checkout.findById(req.params.id).lean();
+    let order = null;
+    if (req.params.id.match(/^[0-9a-fA-F]{24}$/)) {
+      order = await Checkout.findById(req.params.id).lean();
+    }
+    if (!order) {
+      order = await Checkout.findOne({ orderId: req.params.id }).lean();
+    }
     if (!order) return res.status(404).json({ ok: false, error: "الطلب غير موجود" });
+    order = await populateOrderItemsImages(order);
     res.json(order);
   } catch (err) {
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
@@ -126,13 +177,30 @@ router.put("/:id/status", authMiddleware, async (req, res) => {
     if (!["pending", "confirmed", "cancelled"].includes(status)) {
       return res.status(400).json({ ok: false, error: "حالة غير صالحة" });
     }
-    const order = await Checkout.findByIdAndUpdate(
-      req.params.id,
-      { status },
-      { returnDocument: "after" }
-    );
+    const order = await Checkout.findById(req.params.id);
     if (!order) return res.status(404).json({ ok: false, error: "الطلب غير موجود" });
-    res.json(order);
+
+    if (order.status === status) return res.json(order);
+
+    const allowed = ALLOWED_STATUS_TRANSITIONS[order.status] || [];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({
+        ok: false,
+        error: `لا يمكن تحويل الطلب من حالة "${order.status}" إلى "${status}"`,
+      });
+    }
+
+    order.status = status;
+    order.statusHistory = order.statusHistory || [];
+    order.statusHistory.push({
+      status,
+      changedAt: new Date(),
+      changedBy: req.admin?.email || "admin",
+    });
+
+    await order.save();
+    const result = await populateOrderItemsImages(order.toObject());
+    res.json(result);
   } catch (err) {
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
   }
