@@ -209,7 +209,10 @@ router.delete("/company/image/:field", authMiddleware, async (req, res) => {
 router.get("/company", async (req, res) => {
   try {
     const cached = cache.get("company_data");
-    if (cached) return res.json(cached);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
+      return res.json(cached);
+    }
 
     let company = await Company.findOne().lean();
     if (!company) {
@@ -225,6 +228,7 @@ router.get("/company", async (req, res) => {
       await Company.updateOne({ _id: company._id }, { footerItems: company.footerItems });
     }
     cache.set("company_data", company, 600);
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
     res.json(company);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -264,7 +268,10 @@ const DEFAULT_BANNERS = Array(5).fill(null).map(() => ({ url: "", active: true }
 router.get("/banners", async (req, res) => {
   try {
     const cached = cache.get("banners_data");
-    if (cached) return res.json(cached);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
+      return res.json(cached);
+    }
 
     let doc = await Banner.findOne().lean();
     if (!doc) {
@@ -272,6 +279,7 @@ router.get("/banners", async (req, res) => {
       doc = created.toObject();
     }
     cache.set("banners_data", doc.banners, 600);
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
     res.json(doc.banners);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -703,7 +711,10 @@ router.patch("/sub-categories/settings/order", authMiddleware, async (req, res) 
 router.get("/sub-categories/public", async (req, res) => {
   try {
     const cached = cache.get("categories_public");
-    if (cached) return res.json(cached);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
+      return res.json(cached);
+    }
 
     const [result, customImages] = await Promise.all([
       Product.aggregate([
@@ -716,6 +727,7 @@ router.get("/sub-categories/public", async (req, res) => {
     const imageMap = new Map(customImages.map((s) => [s.category, s.image]));
     const data = result.map((r) => ({ name: r._id, count: r.count, image: imageMap.get(r._id) || r.image }));
     cache.set("categories_public", data, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
     res.json(data);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -748,10 +760,14 @@ router.post("/sub-categories/settings/image", authMiddleware, upload.single("ima
 router.get("/sub-categories/home-settings", async (req, res) => {
   try {
     const cached = cache.get("categories_home_settings");
-    if (cached) return res.json(cached);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
+      return res.json(cached);
+    }
 
     const settings = await SubCategorySettings.find({ category: { $ne: "__config__" } }).sort({ order: 1 }).lean();
     cache.set("categories_home_settings", settings, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
     res.json(settings);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1739,7 +1755,10 @@ router.get("/category-banners-bulk", async (req, res) => {
     
     const cacheKey = `cat_banners_bulk_${names.slice().sort().join("_")}`;
     const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
+      return res.json(cached);
+    }
 
     const docs = await CategoryBanner.find({ category: { $in: names } }).lean();
     const result = {};
@@ -1748,6 +1767,7 @@ router.get("/category-banners-bulk", async (req, res) => {
       if (active.length) result[doc.category] = active;
     }
     cache.set(cacheKey, result, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
     res.json(result);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });
@@ -1760,11 +1780,15 @@ router.get("/category-banners/:category", async (req, res) => {
     const { category } = req.params;
     const cacheKey = `cat_banner_${category}`;
     const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
+      return res.json(cached);
+    }
 
     const doc = await CategoryBanner.findOne({ category }).lean();
     const banners = doc && doc.banners && doc.banners.length ? doc.banners : [{ url: "", active: true }];
     cache.set(cacheKey, banners, 300);
+    res.setHeader("Cache-Control", "public, max-age=300, s-maxage=600, stale-while-revalidate=1200");
     res.json(banners);
   } catch {
     res.status(500).json({ error: "خطأ في الخادم" });

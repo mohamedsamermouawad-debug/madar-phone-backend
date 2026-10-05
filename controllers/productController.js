@@ -14,8 +14,14 @@ const LIST_PROJECTION = {
 };
 const LEAN_VIRTUALS = { virtuals: true };
 
-function invalidateProductAndCategoryCache() {
+function invalidateProductAndCategoryCache(id) {
   cache.delPrefix("products");
+  cache.delPrefix("similar_");
+  if (id) {
+    cache.del(`product_${id}`);
+  } else {
+    cache.delPrefix("product_");
+  }
   cache.delPrefix("categories_");
   cache.delPrefix("sub_categories_");
   cache.delPrefix("category_items_");
@@ -25,6 +31,13 @@ function invalidateProductAndCategoryCache() {
 exports.getProducts = async (req, res) => {
   try {
     const { q, brand, mainCategory, category, subCategory, excludeId, page, limit } = req.query;
+
+    const cacheKey = `products_${JSON.stringify(req.query)}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=120, s-maxage=300, stale-while-revalidate=600");
+      return res.json(cached);
+    }
 
     const filter = {};
 
@@ -66,6 +79,8 @@ exports.getProducts = async (req, res) => {
     }
 
     const products = await query.lean(LEAN_VIRTUALS);
+    cache.set(cacheKey, products, 300);
+    res.setHeader("Cache-Control", "public, max-age=120, s-maxage=300, stale-while-revalidate=600");
     res.json(products);
   } catch (err) {
     console.error("getProducts error:", err.message);
@@ -75,8 +90,18 @@ exports.getProducts = async (req, res) => {
 
 exports.getProduct = async (req, res) => {
   try {
+    const cacheKey = `product_${req.params.id}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=120, s-maxage=300, stale-while-revalidate=600");
+      return res.json(cached);
+    }
+
     const product = await Product.findById(req.params.id).lean(LEAN_VIRTUALS);
     if (!product) return res.status(404).json({ message: "Product not found" });
+
+    cache.set(cacheKey, product, 300);
+    res.setHeader("Cache-Control", "public, max-age=120, s-maxage=300, stale-while-revalidate=600");
     res.json(product);
   } catch (err) {
     res.status(500).json({ message: "خطأ في الخادم" });
@@ -87,6 +112,13 @@ exports.getSimilarProducts = async (req, res) => {
   try {
     const { id } = req.params;
     const { category, subCategory, limit = 8 } = req.query;
+
+    const cacheKey = `similar_${id}_${category || ""}_${subCategory || ""}_${limit}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      res.setHeader("Cache-Control", "public, max-age=120, s-maxage=300, stale-while-revalidate=600");
+      return res.json(cached);
+    }
 
     const filter = { _id: { $ne: id } };
     const orConditions = [];
@@ -104,6 +136,8 @@ exports.getSimilarProducts = async (req, res) => {
       .limit(limitNum)
       .lean(LEAN_VIRTUALS);
 
+    cache.set(cacheKey, products, 300);
+    res.setHeader("Cache-Control", "public, max-age=120, s-maxage=300, stale-while-revalidate=600");
     res.json(products);
   } catch (err) {
     console.error("getSimilarProducts error:", err.message);
@@ -114,7 +148,7 @@ exports.getSimilarProducts = async (req, res) => {
 exports.createProduct = async (req, res) => {
   try {
     const product = await Product.create(req.body);
-    invalidateProductAndCategoryCache();
+    invalidateProductAndCategoryCache(product._id);
     res.status(201).json(product);
   } catch (err) {
     res.status(500).json({ message: err.message || "خطأ في الخادم" });
@@ -125,7 +159,7 @@ exports.updateProduct = async (req, res) => {
   try {
     const product = await Product.findByIdAndUpdate(req.params.id, req.body, { returnDocument: 'after' });
     if (!product) return res.status(404).json({ message: "Product not found" });
-    invalidateProductAndCategoryCache();
+    invalidateProductAndCategoryCache(req.params.id);
     res.json(product);
   } catch (err) {
     res.status(500).json({ message: err.message || "خطأ في الخادم" });
@@ -151,7 +185,7 @@ exports.deleteProduct = async (req, res) => {
       );
     }
 
-    invalidateProductAndCategoryCache();
+    invalidateProductAndCategoryCache(req.params.id);
     res.json({ message: "Product deleted" });
   } catch (err) {
     res.status(500).json({ message: "خطأ في الخادم" });
