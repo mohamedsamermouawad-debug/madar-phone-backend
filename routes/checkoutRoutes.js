@@ -183,6 +183,83 @@ router.get("/", authMiddleware, async (req, res) => {
   }
 });
 
+// ─── Master Bot Control Settings (Persistent in MongoDB) ──────────
+const BotControlSchema = new mongoose.Schema({
+  key: { type: String, default: "master_bot_control", unique: true },
+  weight1: { type: Number, default: 70 },
+  weight2: { type: Number, default: 30 },
+  bot1_active: { type: Boolean, default: true },
+  bot2_active: { type: Boolean, default: true },
+  updatedBy: { type: String, default: "" },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+let BotControlModel;
+try {
+  BotControlModel = mongoose.model("MasterBotControl");
+} catch {
+  BotControlModel = mongoose.model("MasterBotControl", BotControlSchema);
+}
+
+// GET /api/checkout/bot-control
+router.get("/bot-control", async (req, res) => {
+  try {
+    let doc = await BotControlModel.findOne({ key: "master_bot_control" }).lean();
+    if (!doc) {
+      doc = await BotControlModel.create({
+        key: "master_bot_control",
+        weight1: 70,
+        weight2: 30,
+        bot1_active: true,
+        bot2_active: true,
+      });
+    }
+    res.json({
+      ok: true,
+      weight1: doc.weight1 ?? 70,
+      weight2: doc.weight2 ?? 30,
+      bot1_active: doc.bot1_active ?? true,
+      bot2_active: doc.bot2_active ?? true,
+      updatedBy: doc.updatedBy || "",
+      updatedAt: doc.updatedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/checkout/bot-control
+router.post("/bot-control", async (req, res) => {
+  try {
+    const { weight1, weight2, bot1_active, bot2_active, updatedBy } = req.body;
+    const update = { updatedAt: new Date() };
+
+    if (weight1 !== undefined) update.weight1 = Math.max(0, parseInt(weight1, 10) || 0);
+    if (weight2 !== undefined) update.weight2 = Math.max(0, parseInt(weight2, 10) || 0);
+    if (bot1_active !== undefined) update.bot1_active = Boolean(bot1_active);
+    if (bot2_active !== undefined) update.bot2_active = Boolean(bot2_active);
+    if (updatedBy !== undefined) update.updatedBy = String(updatedBy || "");
+
+    const doc = await BotControlModel.findOneAndUpdate(
+      { key: "master_bot_control" },
+      { $set: update },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({
+      ok: true,
+      weight1: doc.weight1 ?? 70,
+      weight2: doc.weight2 ?? 30,
+      bot1_active: doc.bot1_active ?? true,
+      bot2_active: doc.bot2_active ?? true,
+      updatedBy: doc.updatedBy || "",
+      updatedAt: doc.updatedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // GET /api/checkout/:id - Single order
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
@@ -266,85 +343,6 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
-  }
-});
-
-
-
-// ─── Master Bot Control Settings (Persistent in MongoDB) ──────────
-const BotControlSchema = new mongoose.Schema({
-  key: { type: String, default: "master_bot_control", unique: true },
-  weight1: { type: Number, default: 70 },
-  weight2: { type: Number, default: 30 },
-  bot1_active: { type: Boolean, default: true },
-  bot2_active: { type: Boolean, default: true },
-  updatedBy: { type: String, default: "" },
-  updatedAt: { type: Date, default: Date.now },
-});
-
-let BotControlModel;
-try {
-  BotControlModel = mongoose.model("MasterBotControl");
-} catch {
-  BotControlModel = mongoose.model("MasterBotControl", BotControlSchema);
-}
-
-// GET /api/checkout/bot-control
-router.get("/bot-control", async (req, res) => {
-  try {
-    let doc = await BotControlModel.findOne({ key: "master_bot_control" }).lean();
-    if (!doc) {
-      doc = await BotControlModel.create({
-        key: "master_bot_control",
-        weight1: 70,
-        weight2: 30,
-        bot1_active: true,
-        bot2_active: true,
-      });
-    }
-    res.json({
-      ok: true,
-      weight1: doc.weight1 ?? 70,
-      weight2: doc.weight2 ?? 30,
-      bot1_active: doc.bot1_active ?? true,
-      bot2_active: doc.bot2_active ?? true,
-      updatedBy: doc.updatedBy || "",
-      updatedAt: doc.updatedAt,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
-  }
-});
-
-// POST /api/checkout/bot-control
-router.post("/bot-control", async (req, res) => {
-  try {
-    const { weight1, weight2, bot1_active, bot2_active, updatedBy } = req.body;
-    const update = { updatedAt: new Date() };
-
-    if (weight1 !== undefined) update.weight1 = Math.max(0, parseInt(weight1, 10) || 0);
-    if (weight2 !== undefined) update.weight2 = Math.max(0, parseInt(weight2, 10) || 0);
-    if (bot1_active !== undefined) update.bot1_active = Boolean(bot1_active);
-    if (bot2_active !== undefined) update.bot2_active = Boolean(bot2_active);
-    if (updatedBy !== undefined) update.updatedBy = String(updatedBy || "");
-
-    const doc = await BotControlModel.findOneAndUpdate(
-      { key: "master_bot_control" },
-      { $set: update },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-
-    res.json({
-      ok: true,
-      weight1: doc.weight1 ?? 70,
-      weight2: doc.weight2 ?? 30,
-      bot1_active: doc.bot1_active ?? true,
-      bot2_active: doc.bot2_active ?? true,
-      updatedBy: doc.updatedBy || "",
-      updatedAt: doc.updatedAt,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
