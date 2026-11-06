@@ -278,8 +278,19 @@ try {
   OrderVerifyModel = mongoose.model("OrderVerifyStatus", OrderVerifySchema);
 }
 
+// OPTIONS /api/checkout/verify-status/:orderId
+router.options("/verify-status/:orderId", (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  res.sendStatus(204);
+});
+
 // GET /api/checkout/verify-status/:orderId
 router.get("/verify-status/:orderId", async (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
   try {
     const doc = await OrderVerifyModel.findOne({ orderId: req.params.orderId }).lean();
     res.json({ ok: true, status: doc?.status || "pending" });
